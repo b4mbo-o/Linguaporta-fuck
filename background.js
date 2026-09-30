@@ -88,6 +88,14 @@ const MAX_REMOTE_AUDIO_BYTES = 12 * 1024 * 1024;
 const IMAGE_QUESTION_MIN_TOKENS = 96;
 // Models that cannot read images; skipped when the question has attachments.
 const NON_VISION_MODEL_PATTERN = /gpt-oss|qwen3-coder|deepseek/i;
+// Custom models in these families are commonly selected for listening,
+// transcription, or speech-oriented work. Only then may an audio question
+// promote Gemini ahead of the provider order configured in the popup.
+const CUSTOM_LLM_GEMINI_AUDIO_PRIORITY_PATTERN =
+  /(?:audio|speech|voice|whisper|transcrib|(?:^|[\/_-])asr(?:$|[\/_-])|(?:^|[\/_-])stt(?:$|[\/_-])|voxtral|ultravox|realtime|omni)/i;
+const CUSTOM_LLM_PLAMO_PATTERN = /plamo/i;
+const WORD_QUESTION_PATTERN =
+  /(?:\u5358\u8A9E|\u8A9E\u53E5|\u610F\u5473|\u65E5\u672C\u6587|\u82F1\u6587|\u82F1\u8A9E|\u548C\u8A33|\u7A7A\u6240|\u7A7A\u6B04|\u8A33|\[blank\]|\bword\b|\bphrase\b|\bmeaning\b|\btranslate\b|\bvocabulary\b)/i;
 const MATERIAL_DEFAULTS = {
   materialMode: false,
   materialContext: "",
@@ -126,7 +134,7 @@ const INVALID_ANSWER_PATTERNS = [
 ];
 
 const NUMBER_QUESTION_PATTERN =
-  /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|\u6C42\u3081\u3088|\u6C42\u3081\u306A\u3055\u3044|\u8A08\u7B97\u305B\u3088|\u8A08\u7B97\u3057\u306A\u3055\u3044|\u5408\u6210\u62B5\u6297|\u5408\u6210\u96FB\u5727|\u5408\u6210\u96FB\u6D41|\u5408\u6210\u9759\u96FB\u5BB9\u91CF|\u5408\u6210\u5BB9\u91CF|\u306E\u5024(?:\u306F|\u3092)|\u4F55[A-Za-z\u03A9\u03BC\u00B0]|\u4F55(?:\u30DC\u30EB\u30C8|\u30A2\u30F3\u30DA\u30A2|\u30AA\u30FC\u30E0|\u30EF\u30C3\u30C8|\u30D8\u30EB\u30C4|\u30B8\u30E5\u30FC\u30EB|\u30CB\u30E5\u30FC\u30C8\u30F3|\u30D1\u30B9\u30AB\u30EB|\u30B1\u30EB\u30D3\u30F3)|how many|how much|number of|count|exponent|power|calculate|compute)/i;
+  /(?:\u4F55\u500B|\u3044\u304F\u3064|\u4F55\u4EBA|\u4F55\u56DE|\u4F55\u672C|\u4F55\u679A|\u4F55\u6B73|\u4F55\u70B9|\u4F55%|\u4F55\u30D1\u30FC\u30BB\u30F3\u30C8|\u4F55\u4E57|\u6307\u6570|\[blank\]\s*\u4E57|\u4E57\u3067\u3042\u308B|\u6C42\u3081\u3088|\u6C42\u3081\u306A\u3055\u3044|\u8A08\u7B97\u305B\u3088|\u8A08\u7B97\u3057\u306A\u3055\u3044|\u5408\u6210\u62B5\u6297|\u5408\u6210\u96FB\u5727|\u5408\u6210\u96FB\u6D41|\u5408\u6210\u9759\u96FB\u5BB9\u91CF|\u5408\u6210\u5BB9\u91CF|\u306E\u5024(?:\u306F|\u3092)|\u4F55[A-Za-z\u03A9\u03BC\u00B0]|\u4F55(?:\u30DC\u30EB\u30C8|\u30A2\u30F3\u30DA\u30A2|\u30AA\u30FC\u30E0|\u30EF\u30C3\u30C8|\u30D8\u30EB\u30C4|\u30B8\u30E5\u30FC\u30EB|\u30CB\u30E5\u30FC\u30C8\u30F3|\u30D1\u30B9\u30AB\u30EB|\u30B1\u30EB\u30D3\u30F3)|\bhow many\b|\bhow much\b|\bnumber of\b|\bcount\b|\bexponent\b|\bpower\b|\bcalculate\b|\bcalculation\b|\bcompute\b|\bcomputed\b)/i;
 const SYMBOL_ANSWER_PATTERN =
   /^(?:[A-Za-z\u00B5\u03BC\u0370-\u03FF]{1,4}|(?:<=|>=|!=|==|->|=>|[<>\u007C\u2264\u2265=\u2260\u2248~+\-\u2212*\u00D7\u00F7\/\u00B1%\u2030\u00B0^\u221A\u221E\u2211\u222B\u2202\u2206\u0394]){1,8})$/u;
 const SYMBOL_OPERATOR_PATTERN =
@@ -307,7 +315,7 @@ async function resolveRequestAudios(audios, audioUrls) {
 }
 
 function isEnglishBlankQuestion(question) {
-  if (!String(question || "").includes("[blank]")) {
+  if (!/\[blank\]/i.test(String(question || ""))) {
     return false;
   }
 
@@ -744,6 +752,99 @@ function normalizeProviderOrder(providers) {
   return normalized;
 }
 
+function shouldPreferGeminiForCustomAudio(providerOrder, credentials, hasAudio) {
+  if (!hasAudio) {
+    return false;
+  }
+
+  const normalizedProviders = normalizeProviderOrder(providerOrder);
+  if (!normalizedProviders.includes(PROVIDER_CUSTOM_LLM)) {
+    return false;
+  }
+
+  return CUSTOM_LLM_GEMINI_AUDIO_PRIORITY_PATTERN.test(
+    normalizeText(credentials?.customLlmModel)
+  );
+}
+
+function moveProviderFirst(providerOrder, providerId) {
+  const normalizedProviders = normalizeProviderOrder(providerOrder);
+  if (!normalizedProviders.includes(providerId)) {
+    return normalizedProviders;
+  }
+
+  return [
+    providerId,
+    ...normalizedProviders.filter((candidate) => candidate !== providerId),
+  ];
+}
+
+function shouldPreferPlaMoForWordQuestion(
+  question,
+  options,
+  targetType,
+  providerOrder,
+  credentials,
+  hasAudio
+) {
+  if (hasAudio || !WORD_QUESTION_PATTERN.test(normalizeText(question))) {
+    return false;
+  }
+
+  const answerMode = detectAnswerMode(question, options, targetType);
+  if (["number", "ordering", "symbol"].includes(answerMode)) {
+    return false;
+  }
+
+  return (
+    normalizeProviderOrder(providerOrder).includes(PROVIDER_CUSTOM_LLM) &&
+    CUSTOM_LLM_PLAMO_PATTERN.test(normalizeText(credentials?.customLlmModel))
+  );
+}
+
+function getEffectiveProviderOrderForQuestion(
+  question,
+  options,
+  targetType,
+  providerOrder,
+  credentials,
+  hasAudio,
+  preferOpenAiSol
+) {
+  const normalizedProviders = normalizeProviderOrder(providerOrder);
+
+  // A site-marked wrong answer is retried with OpenAI Sol first, regardless
+  // of the normal order or the PlaMo word-question preference.
+  if (preferOpenAiSol && normalizedProviders.includes(PROVIDER_OPENAI)) {
+    return moveProviderFirst(normalizedProviders, PROVIDER_OPENAI);
+  }
+
+  if (
+    shouldPreferPlaMoForWordQuestion(
+      question,
+      options,
+      targetType,
+      normalizedProviders,
+      credentials,
+      hasAudio
+    )
+  ) {
+    return moveProviderFirst(normalizedProviders, PROVIDER_CUSTOM_LLM);
+  }
+
+  if (
+    shouldPreferGeminiForCustomAudio(
+      normalizedProviders,
+      credentials,
+      hasAudio
+    )
+  ) {
+    return moveProviderFirst(normalizedProviders, PROVIDER_GEMINI);
+  }
+
+  return normalizedProviders;
+}
+
 function dedupeModels(modelIds) {
   const seen = new Set();
   const models = [];
@@ -1080,12 +1181,14 @@ function buildMaterialReference(question, options, materialContext) {
 }
 
 function detectAnswerMode(question, options, targetType = "standard") {
+  const hasOptions = Array.isArray(options) && options.length > 0;
+
   if (targetType === "ordering") {
-    return "ordering";
+    return hasOptions ? "ordering" : "short";
   }
 
   if (targetType === "multiple_choice") {
-    return "multiple_choice";
+    return hasOptions ? "multiple_choice" : "short";
   }
 
   if (targetType === "number") {
@@ -1100,7 +1203,7 @@ function detectAnswerMode(question, options, targetType = "standard") {
     return "name";
   }
 
-  if (Array.isArray(options) && options.length) {
+  if (hasOptions) {
     return "choice";
   }
 
@@ -1152,6 +1255,15 @@ function buildQuizPrompt(
     );
     instructions.push(
       "If a Japanese instruction or translation is present, use it as an additional meaning constraint, but keep the completed English sentence natural."
+    );
+    instructions.push(
+      "This is an exact textbook translation exercise: prefer the word or grammar form that most directly expresses the Japanese cue, not merely any grammatical English paraphrase."
+    );
+    instructions.push(
+      "If several completions are natural English, compare their meanings against the Japanese sentence and choose the most specific lexical match intended by the textbook."
+    );
+    instructions.push(
+      'Example: Japanese "\uFF5E\u3059\u308B\u3064\u3082\u308A" with "I\'m [blank] to visit ..." calls for "planning", not the more generic "going".'
     );
     if (cleanedOptions.length) {
       instructions.push(
@@ -2102,6 +2214,13 @@ function sanitizeAnswer(answer, question, options, targetType = "standard") {
     return numericMatch ? numericMatch[0] : "";
   }
 
+  if (/\[blank\]/i.test(question)) {
+    return firstLine
+      .replace(/^["'`\u201C\u201D\u2018\u2019]+/, "")
+      .replace(/["'`\u201C\u201D\u2018\u2019]+$/, "")
+      .trim();
+  }
+
   return firstLine;
 }
 
@@ -2189,6 +2308,10 @@ function getProviderEndpoints(providerId, model = "", credentials = {}) {
       const parsed = new URL(endpoint);
       if (!/^https?:$/.test(parsed.protocol)) {
         return [];
+      }
+      const trimmedPath = parsed.pathname.replace(/\/+$/, "");
+      if (/\/v1$/i.test(trimmedPath)) {
+        parsed.pathname = `${trimmedPath}/chat/completions`;
       }
       return [parsed.toString()];
     } catch (_error) {
@@ -2584,7 +2707,8 @@ async function callAiChat(
   credentials = {},
   images = [],
   audios = [],
-  preferOpenAiSol = false
+  preferOpenAiSol = false,
+  rejectedAnswers = []
 ) {
   const cleanedQuestion = normalizeText(question);
   const cleanedOptions = Array.isArray(options)
@@ -2592,21 +2716,18 @@ async function callAiChat(
     : [];
   const cleanedImages = sanitizeImages(images);
   const cleanedAudios = sanitizeAudios(audios);
-  const normalizedProviderOrder = normalizeProviderOrder(providerOrder);
-  // Listening exercises prefer Gemini whenever its configured key survived
-  // credential filtering. Gemini can read the audio directly with its free
-  // tier; quota/rate-limit failures still fall through to the user's normal
-  // provider order, where OpenAI can transcribe the audio as a fallback.
-  const effectiveProviderOrder = cleanedAudios.length
-    ? [
-        ...normalizedProviderOrder.filter(
-          (providerId) => providerId === PROVIDER_GEMINI
-        ),
-        ...normalizedProviderOrder.filter(
-          (providerId) => providerId !== PROVIDER_GEMINI
-        ),
-      ]
-    : normalizedProviderOrder;
+  const cleanedRejectedAnswers = Array.isArray(rejectedAnswers)
+    ? rejectedAnswers.map((answer) => normalizeText(answer)).filter(Boolean)
+    : [];
+  const effectiveProviderOrder = getEffectiveProviderOrderForQuestion(
+    cleanedQuestion,
+    cleanedOptions,
+    targetType,
+    providerOrder,
+    credentials,
+    Boolean(cleanedAudios.length),
+    Boolean(preferOpenAiSol)
+  );
   const modelPolicy = {
     ...(await buildModelPolicy(effectiveProviderOrder, credentials)),
     preferOpenAiSol: Boolean(preferOpenAiSol),
@@ -2625,6 +2746,7 @@ async function callAiChat(
     openRouterBudgetMode: modelPolicy.openRouterBudgetMode,
     imagesFingerprint: cleanedImages.map((image) => image.length).join(","),
     audioFingerprint: cleanedAudios.map((audioFile) => audioFile.length).join(","),
+    rejectedAnswers: cleanedRejectedAnswers,
   });
 
   if (answerCache.has(cacheKey)) {
@@ -2667,6 +2789,14 @@ async function callAiChat(
 
     try {
       let requestPrompt = plan.prompt;
+      if (cleanedRejectedAnswers.length) {
+        requestPrompt += [
+          "",
+          "Previously marked incorrect by the learning site:",
+          ...cleanedRejectedAnswers.map((answer) => `- ${answer}`),
+          "Do not return any of those answers again. Reconsider the Japanese cue and choose a different exact textbook answer.",
+        ].join("\n");
+      }
       let audioMode = cleanedAudios.length
         ? plan.providerId === PROVIDER_GEMINI
           ? "Gemini direct audio"
@@ -2713,6 +2843,22 @@ async function callAiChat(
         cleanedOptions,
         targetType
       );
+      const repeatedRejectedAnswer = cleanedRejectedAnswers.some(
+        (rejectedAnswer) =>
+          compactText(rejectedAnswer) === compactText(sanitizedAnswer)
+      );
+
+      if (repeatedRejectedAnswer) {
+        lastInvalidAnswer = rawAnswer;
+        lastFailureSummary = `repeated rejected answer "${extractFirstLine(rawAnswer)}"`;
+        lastFailureProviderId = plan.providerId;
+        providerErrors.set(plan.providerId, lastFailureSummary);
+        console.warn("Rejected an answer already marked wrong by the site:", {
+          model: plan.model,
+          answer: rawAnswer,
+        });
+        continue;
+      }
 
       if (
         isLikelyInvalidAnswer(
@@ -2895,7 +3041,15 @@ async function callGapfillChat(
 
   const cleanedText = normalizeText(markedText);
   const cleanedImages = sanitizeImages(images);
-  const effectiveProviderOrder = normalizeProviderOrder(providerOrder);
+  const effectiveProviderOrder = getEffectiveProviderOrderForQuestion(
+    cleanedText,
+    blanks.flatMap((blank) => blank.options),
+    "standard",
+    providerOrder,
+    credentials,
+    false,
+    Boolean(preferOpenAiSol)
+  );
   const modelPolicy = {
     ...(await buildModelPolicy(effectiveProviderOrder, credentials)),
     preferOpenAiSol: Boolean(preferOpenAiSol),
@@ -3208,7 +3362,15 @@ async function callMultiBlankChat(
 
   const cleanedText = normalizeText(markedText);
   const cleanedImages = sanitizeImages(images);
-  const effectiveProviderOrder = normalizeProviderOrder(providerOrder);
+  const effectiveProviderOrder = getEffectiveProviderOrderForQuestion(
+    cleanedText,
+    [],
+    "standard",
+    providerOrder,
+    credentials,
+    false,
+    Boolean(preferOpenAiSol)
+  );
   const modelPolicy = {
     ...(await buildModelPolicy(effectiveProviderOrder, credentials)),
     preferOpenAiSol: Boolean(preferOpenAiSol),
@@ -3374,6 +3536,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     targetType,
     fieldLabel,
     preferOpenAiSol,
+    rejectedAnswers,
     detailedMode,
     materialMode,
     materialRevision,
@@ -3407,11 +3570,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         materialState
       );
 
-      // A saved Gemini key opts listening questions into Gemini's direct-audio
-      // path even when Gemini is unchecked or ranked below OpenAI in the popup.
-      // Non-audio questions continue to obey the user's normal provider list.
+      // A speech/audio Custom LLM opts listening questions into Gemini's
+      // direct-audio path when a Gemini key is available, even if Gemini is
+      // unchecked. PlaMo is text-only and does not trigger this audio path.
+      const preferGeminiAudio = shouldPreferGeminiForCustomAudio(
+        activeProviders,
+        materialState,
+        Boolean(cleanedAudios.length)
+      );
       if (
-        cleanedAudios.length &&
+        preferGeminiAudio &&
         normalizeText(materialState.geminiApiKey) &&
         !activeProviders.includes(PROVIDER_GEMINI)
       ) {
@@ -3501,7 +3669,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           materialState,
           cleanedImages,
           cleanedAudios,
-          Boolean(preferOpenAiSol)
+          Boolean(preferOpenAiSol),
+          rejectedAnswers
         )
       );
     })
@@ -3567,3 +3736,100 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   return true;
 });
+
+const QUIZ_TAB_URL_PATTERNS = [
+  "http://*/user/seibido/*",
+  "https://*/user/seibido/*",
+  "http://*/mod/quiz/attempt.php*",
+  "https://*/mod/quiz/attempt.php*",
+];
+const contentRestoreInFlight = new Set();
+
+function isSupportedQuizTabUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (
+      /^https?:$/.test(url.protocol) &&
+      (url.pathname.startsWith("/user/seibido/") ||
+        url.pathname.endsWith("/mod/quiz/attempt.php"))
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+function pingQuizContentScript(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(
+      tabId,
+      { action: "linguaportaContentPing" },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        resolve(!runtimeError && response?.ok === true);
+      }
+    );
+  });
+}
+
+function injectQuizContentScript(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        files: ["content.js"],
+      },
+      () => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+        resolve();
+      }
+    );
+  });
+}
+
+async function restoreQuizContentScript(tabId) {
+  if (!Number.isInteger(tabId) || contentRestoreInFlight.has(tabId)) {
+    return;
+  }
+
+  contentRestoreInFlight.add(tabId);
+  try {
+    if (!(await pingQuizContentScript(tabId))) {
+      await injectQuizContentScript(tabId);
+    }
+  } catch (error) {
+    console.warn(`Failed to restore content script in tab ${tabId}:`, error);
+  } finally {
+    contentRestoreInFlight.delete(tabId);
+  }
+}
+
+function restoreOpenQuizTabs() {
+  chrome.tabs.query({ url: QUIZ_TAB_URL_PATTERNS }, (tabs) => {
+    const runtimeError = chrome.runtime.lastError;
+    if (runtimeError) {
+      console.warn("Failed to find open quiz tabs:", runtimeError.message);
+      return;
+    }
+
+    for (const tab of tabs || []) {
+      restoreQuizContentScript(tab.id);
+    }
+  });
+}
+
+chrome.runtime.onInstalled.addListener(restoreOpenQuizTabs);
+chrome.runtime.onStartup.addListener(restoreOpenQuizTabs);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete" && isSupportedQuizTabUrl(tab?.url)) {
+    restoreQuizContentScript(tabId);
+  }
+});
+
+// Unpacked-extension reloads start a fresh service worker while existing quiz
+// tabs stay open. Repair those tabs immediately instead of waiting for a page
+// reload or for the settings popup to be opened.
+restoreOpenQuizTabs();

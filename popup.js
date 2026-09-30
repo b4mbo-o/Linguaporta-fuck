@@ -177,6 +177,73 @@ function saveSettings(partialSettings) {
   });
 }
 
+function isSupportedQuizTabUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (
+      /^https?:$/.test(url.protocol) &&
+      (url.pathname.startsWith("/user/seibido/") ||
+        url.pathname.endsWith("/mod/quiz/attempt.php"))
+    );
+  } catch (_error) {
+    return false;
+  }
+}
+
+function getActiveTab() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      resolve(Array.isArray(tabs) ? tabs[0] || null : null);
+    });
+  });
+}
+
+function pingContentScript(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(
+      tabId,
+      { action: "linguaportaContentPing" },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        resolve(!runtimeError && response?.ok === true);
+      }
+    );
+  });
+}
+
+function injectContentScript(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        files: ["content.js"],
+      },
+      () => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+        resolve();
+      }
+    );
+  });
+}
+
+async function ensureContentScriptOnActiveTab() {
+  const tab = await getActiveTab();
+  if (!tab?.id || !isSupportedQuizTabUrl(tab.url)) {
+    return false;
+  }
+
+  if (await pingContentScript(tab.id)) {
+    return true;
+  }
+
+  await injectContentScript(tab.id);
+  return true;
+}
+
 function formatDateTime(timestamp) {
   return new Intl.DateTimeFormat("ja-JP", {
     month: "numeric",
@@ -580,6 +647,11 @@ statusWidgetToggle.addEventListener("change", async () => {
   await saveSettings({
     showStatusWidget: statusWidgetToggle.checked,
   });
+  if (statusWidgetToggle.checked) {
+    await ensureContentScriptOnActiveTab().catch((error) => {
+      console.warn("Failed to restore the status widget:", error);
+    });
+  }
   await refresh();
 });
 
@@ -963,4 +1035,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
-refresh();
+ensureContentScriptOnActiveTab()
+  .catch((error) => {
+    console.warn("Failed to connect to the active quiz tab:", error);
+  })
+  .finally(refresh);

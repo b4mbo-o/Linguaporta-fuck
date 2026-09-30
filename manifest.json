@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinguaportaFuck",
-  "version": "1.0",
+  "version": "1.0.5",
   "description": "Linguaporta quiz helper using OpenAI, OpenRouter, Gemini, and custom OpenAI-compatible LLM APIs.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
@@ -25,8 +25,8 @@
   "content_scripts": [
     {
       "matches": [
-        "http://*/user/seibido/index.php*",
-        "https://*/user/seibido/index.php*",
+        "http://*/user/seibido/*",
+        "https://*/user/seibido/*",
         "http://*/mod/quiz/attempt.php*",
         "https://*/mod/quiz/attempt.php*"
       ],

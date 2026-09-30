@@ -9,6 +9,8 @@ const MATCHING_ROW_SELECTOR = ".answer.table-reboot tr";
 const DDWTOS_DROP_SELECTOR = ".qtext .drop[class*='group']";
 const LINGUAPORTA_QUESTION_SELECTOR = "#problem-area";
 const LINGUAPORTA_ANSWER_SELECTOR = "#drill_form";
+const EDITABLE_TEXT_CONTROL_SELECTOR =
+  "input:not([type]), input[type='text'], input[type='number'], textarea";
 const MAX_CONCURRENT_REQUESTS = 2;
 const MAX_IMAGES_PER_QUESTION = 4;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
@@ -16,12 +18,14 @@ const MAX_AUDIO_FILES_PER_QUESTION = 1;
 const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
 const RETRY_SUBMIT_GUARD_STORAGE_KEY = "linguaportaSolRetryGuards";
 const RETRY_SUBMIT_GUARD_TTL_MS = 30 * 60 * 1000;
-// V2 excludes provider-chain failures from the two-answer limit. A new key
-// prevents failures recorded by the older behavior from blocking a retry.
-const AI_ANSWER_ATTEMPTS_STORAGE_KEY = "linguaportaAiAnswerAttemptsV2";
+// V3 starts a fresh two-answer window after the blank-answer strategy gained
+// rejected-answer feedback; older failed attempts must not block verification.
+const AI_ANSWER_ATTEMPTS_STORAGE_KEY = "linguaportaAiAnswerAttemptsV3";
 const AI_ANSWER_ATTEMPT_TTL_MS = 30 * 60 * 1000;
 const MAX_AI_ANSWERS_PER_QUESTION = 2;
 const AI_ANSWER_LIMIT_ERROR_CODE = "AI_ANSWER_LIMIT_REACHED";
+const LEARNED_ANSWERS_STORAGE_KEY = "linguaportaLearnedAnswersV1";
+const MAX_LEARNED_ANSWERS = 2000;
 
 const answerCache = new Map();
 const imageDataUrlCache = new Map();
@@ -34,6 +38,7 @@ let scanScheduled = false;
 let deferredScanRequested = false;
 let autoAdvanceScheduledKey = "";
 let autoSubmittedButtons = new WeakSet();
+let autoRevealedButtons = new WeakSet();
 let runtimeActionEpoch = 0;
 const retrySubmitReservations = new Set();
 const aiAttemptReservationChains = new Map();
@@ -531,6 +536,12 @@ function buildQuestionKey(
 function ensureStatusWidget() {
   let widget = document.getElementById(STATUS_WIDGET_ID);
   if (widget) {
+    // The DOM can survive an extension reload even though its old content
+    // script context (and event listeners) no longer works. Reattach the
+    // current listener when the popup restores the script.
+    widget
+      .querySelector(".moodle-status-toggle")
+      ?.addEventListener("click", toggleRuntimeFromStatusWidget);
     syncStatusWidgetVisibility();
     return widget;
   }
@@ -768,9 +779,7 @@ function extractLinguaportaAnswerPrompt(answerRoot) {
   }
 
   const inlineAnswerControls = Array.from(
-    answerRoot.querySelectorAll(
-      "input[type='text'], input[type='number'], textarea, select"
-    )
+    answerRoot.querySelectorAll(`${EDITABLE_TEXT_CONTROL_SELECTOR}, select`)
   );
   const lines = inlineAnswerControls
     .map((control) => getLinguaportaControlLine(answerRoot, control))
@@ -922,7 +931,7 @@ function applyLinguaportaAnswer(question, answerText) {
   }
 
   const textControls = Array.from(
-    answerRoot.querySelectorAll("input[type='text'], input[type='number'], textarea")
+    answerRoot.querySelectorAll(EDITABLE_TEXT_CONTROL_SELECTOR)
   ).filter((control) => !control.disabled && !control.readOnly);
   if (!question.options?.length && textControls.length === 1) {
     const value = String(answerText || "").trim();
@@ -1063,22 +1072,84 @@ function isLinguaportaIncorrectResult(questionRoot) {
   );
 }
 
+function extractLinguaportaRejectedAnswers(questionRoot) {
+  if (!isLinguaportaIncorrectResult(questionRoot)) {
+    return [];
+  }
+
+  const answerInfo = questionRoot.querySelector("#answer_info");
+  if (!answerInfo) {
+    return [];
+  }
+
+  const rejected = Array.from(
+    answerInfo.querySelectorAll(
+      "s, del, strike, [style*='line-through' i]"
+    )
+  )
+    .filter(
+      (element) =>
+        !element.querySelector("s, del, strike, [style*='line-through' i]")
+    )
+    .map((element) => normalizeText(element.textContent))
+    .filter(Boolean);
+
+  return Array.from(new Set(rejected));
+}
+
+function extractLinguaportaRevealedCorrectAnswer(questionRoot) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return null;
+  }
+
+  // "正解を見る" replaces the editable answer row with a .qu03 sentence
+  // whose answer controls are readonly. The problem id changes on this page,
+  // so the normalized prompt—not xlast_problem_num—is used for persistence.
+  const solutionControls = Array.from(
+    questionRoot.querySelectorAll(
+      "#question_area .qu03 input[readonly], #question_area .qu03 textarea[readonly]"
+    )
+  );
+  if (solutionControls.length !== 1) {
+    return null;
+  }
+
+  const answer = normalizeText(solutionControls[0].value);
+  const questionText = extractLinguaportaQuestionText(questionRoot);
+  if (!answer || !questionText) {
+    return null;
+  }
+
+  return {
+    answer,
+    question: {
+      questionText,
+      options: [],
+      targetType: "standard",
+    },
+  };
+}
+
 function findLinguaportaNextProblemButton() {
   return Array.from(
     document.querySelectorAll(
-      ".problem-next-group input.button-next-problem[type='submit']"
+      ".problem-next-group input, .problem-next-group button, input.button-next-problem, button.button-next-problem, input[type='submit'], input[type='button'], button"
     )
   ).find((button) => {
     const label = normalizeText(button.value || button.textContent);
-    const action = normalizeText(
-      button.form?.querySelector("input[type='hidden'][name='action']")?.value
-    );
-    return !button.disabled && label === "次の問題" && action === "次の問題";
+    return !button.disabled && label === "次の問題";
   });
 }
 
-function scheduleLinguaportaAutoAdvance(questionRoot) {
-  if (!isLinguaportaCorrectResult(questionRoot)) {
+function scheduleLinguaportaAutoAdvance(
+  questionRoot,
+  { allowRevealedAnswer = false } = {}
+) {
+  const isCorrectResult = isLinguaportaCorrectResult(questionRoot);
+  const isRevealedAnswer =
+    allowRevealedAnswer &&
+    Boolean(extractLinguaportaRevealedCorrectAnswer(questionRoot));
+  if (!isCorrectResult && !isRevealedAnswer) {
     return false;
   }
 
@@ -1099,10 +1170,14 @@ function scheduleLinguaportaAutoAdvance(questionRoot) {
 
   window.setTimeout(() => {
     const currentRoot = document.querySelector(LINGUAPORTA_QUESTION_SELECTOR);
+    const currentResultCanAdvance =
+      isLinguaportaCorrectResult(currentRoot) ||
+      (allowRevealedAnswer &&
+        Boolean(extractLinguaportaRevealedCorrectAnswer(currentRoot)));
     if (
       actionEpoch !== runtimeActionEpoch ||
       isPaused(currentSettings) ||
-      !isLinguaportaCorrectResult(currentRoot) ||
+      !currentResultCanAdvance ||
       getLinguaportaQuestionId(currentRoot) !== getLinguaportaQuestionId(questionRoot)
     ) {
       return;
@@ -1133,6 +1208,41 @@ function findLinguaportaAnswerButton(questionRoot, allowRetry = false) {
   }
 
   return allowRetry && label === "もう一度解答する" ? button : null;
+}
+
+function findLinguaportaViewAnswerButton(questionRoot) {
+  if (!isLinguaportaIncorrectResult(questionRoot)) {
+    return null;
+  }
+
+  return Array.from(
+    questionRoot.querySelectorAll("input.problem-view-answer, button.problem-view-answer")
+  ).find((button) => {
+    const label = normalizeText(button.value || button.textContent);
+    return !button.disabled && label === "正解を見る";
+  }) || null;
+}
+
+function scheduleLinguaportaViewAnswer(questionRoot) {
+  const viewAnswerButton = findLinguaportaViewAnswerButton(questionRoot);
+  if (!viewAnswerButton || autoRevealedButtons.has(viewAnswerButton)) {
+    return false;
+  }
+
+  autoRevealedButtons.add(viewAnswerButton);
+  const actionEpoch = runtimeActionEpoch;
+  window.setTimeout(() => {
+    if (
+      actionEpoch !== runtimeActionEpoch ||
+      isPaused(currentSettings) ||
+      !questionRoot.isConnected ||
+      findLinguaportaViewAnswerButton(questionRoot) !== viewAnswerButton
+    ) {
+      return;
+    }
+    viewAnswerButton.click();
+  }, 500);
+  return true;
 }
 
 function hashStableQuestion(value) {
@@ -1172,6 +1282,111 @@ function getAiAnswerFingerprint(question) {
     targetType: normalizeText(question?.targetType || "standard"),
   });
   return hashStableQuestion(stableQuestion);
+}
+
+function getStoredObject(storageKey) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get({ [storageKey]: {} }, (items) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      const stored = items?.[storageKey];
+      resolve(
+        stored && typeof stored === "object" && !Array.isArray(stored)
+          ? { ...stored }
+          : {}
+      );
+    });
+  });
+}
+
+function setStoredObject(storageKey, value) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.set({ [storageKey]: value }, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function saveLearnedCorrectAnswer(revealedAnswer) {
+  const answer = normalizeText(revealedAnswer?.answer);
+  const question = revealedAnswer?.question;
+  if (!answer || !question?.questionText) {
+    return null;
+  }
+
+  const fingerprint = getAiAnswerFingerprint(question);
+  const learnedAnswers = await getStoredObject(LEARNED_ANSWERS_STORAGE_KEY);
+  const existingAnswer = normalizeText(learnedAnswers[fingerprint]?.answer);
+  if (existingAnswer === answer) {
+    return { answer, fingerprint, saved: false };
+  }
+
+  learnedAnswers[fingerprint] = {
+    answer,
+    questionText: normalizeText(question.questionText),
+    targetType: normalizeText(question.targetType || "standard"),
+    updatedAt: Date.now(),
+  };
+
+  const trimmedAnswers = Object.fromEntries(
+    Object.entries(learnedAnswers)
+      .sort(
+        (left, right) =>
+          Number(right[1]?.updatedAt || 0) - Number(left[1]?.updatedAt || 0)
+      )
+      .slice(0, MAX_LEARNED_ANSWERS)
+  );
+  await setStoredObject(LEARNED_ANSWERS_STORAGE_KEY, trimmedAnswers);
+  return { answer, fingerprint, saved: true };
+}
+
+async function deleteLearnedCorrectAnswer(question) {
+  const fingerprint = getAiAnswerFingerprint(question);
+  const learnedAnswers = await getStoredObject(LEARNED_ANSWERS_STORAGE_KEY);
+  if (!(fingerprint in learnedAnswers)) {
+    return;
+  }
+  delete learnedAnswers[fingerprint];
+  await setStoredObject(LEARNED_ANSWERS_STORAGE_KEY, learnedAnswers);
+}
+
+async function loadLearnedCorrectAnswer(question) {
+  if (!isLinguaportaQuestionRoot(question?.questionRoot)) {
+    return "";
+  }
+
+  try {
+    const fingerprint = getAiAnswerFingerprint(question);
+    const learnedAnswers = await getStoredObject(LEARNED_ANSWERS_STORAGE_KEY);
+    const answer = normalizeText(learnedAnswers[fingerprint]?.answer);
+    if (!answer) {
+      return "";
+    }
+
+    // If the site ever marks a stored answer wrong (for example after course
+    // content changes), discard it immediately and let the normal AI fallback
+    // find a new answer instead of creating an endless retry loop.
+    const answerKey = normalizeChoiceMatchText(answer);
+    const wasRejected = extractLinguaportaRejectedAnswers(question.questionRoot)
+      .map(normalizeChoiceMatchText)
+      .some((rejectedKey) => rejectedKey === answerKey);
+    if (wasRejected) {
+      await deleteLearnedCorrectAnswer(question);
+      return "";
+    }
+
+    return answer;
+  } catch (error) {
+    console.warn("Failed to load a learned Linguaporta answer:", error);
+    return "";
+  }
 }
 
 function getRetrySubmitFingerprint(question) {
@@ -1632,13 +1847,9 @@ function getChoiceTargetType(questionRoot) {
     // free-text field is the answer target in that layout; treating the whole
     // form as multiple choice makes valid words such as "national" fail the
     // option-membership validator and unnecessarily fall through providers.
-    const hasEditableTextAnswer = Boolean(
-      answerRoot.querySelector(
-        "input[type='text']:not([disabled]):not([readonly]), " +
-          "input[type='number']:not([disabled]):not([readonly]), " +
-          "textarea:not([disabled]):not([readonly])"
-      )
-    );
+    const hasEditableTextAnswer = Array.from(
+      answerRoot.querySelectorAll(EDITABLE_TEXT_CONTROL_SELECTOR)
+    ).some((control) => !control.disabled && !control.readOnly);
     if (hasEditableTextAnswer) {
       return "";
     }
@@ -2777,6 +2988,7 @@ function requestAnswer(question) {
         targetType: question.targetType || "standard",
         fieldLabel: question.fieldLabel || "",
         preferOpenAiSol: isLinguaportaIncorrectResult(question.questionRoot),
+        rejectedAnswers: extractLinguaportaRejectedAnswers(question.questionRoot),
         detailedMode: Boolean(currentSettings.detailedMode),
         materialMode: Boolean(currentSettings.materialMode),
         materialRevision: Number(currentSettings.materialRevision) || 0,
@@ -3136,7 +3348,17 @@ async function hydratePanel(question, panel, options = {}) {
     });
 
     let parsed;
-    if (question.blanks && question.blanks.length) {
+    const learnedAnswer = await loadLearnedCorrectAnswer(question);
+    if (learnedAnswer) {
+      parsed = {
+        answer: learnedAnswer,
+        reason: "「正解を見る」で保存した正答を使用しました。",
+        provider: "saved",
+        model: "correct-answer",
+        audioMode: "",
+        meta: "Source: saved correct answer",
+      };
+    } else if (question.blanks && question.blanks.length) {
       parsed = await resolveGapfillAnswers(question);
     } else if (question.groupMarkedText) {
       parsed = await resolveGroupBlankAnswer(question);
@@ -3206,18 +3428,27 @@ async function hydratePanel(question, panel, options = {}) {
     console.error("Failed to fetch answer:", error);
     const answerLimitReached = error?.code === AI_ANSWER_LIMIT_ERROR_CODE;
     if (answerLimitReached) {
+      const revealScheduled = scheduleLinguaportaViewAnswer(question.questionRoot);
       panel.dataset.loadedKey = loadKey;
       updatePanel(panel, {
         state: "limit",
         status: "Stopped",
         answer: `この問題はAIで${MAX_AI_ANSWERS_PER_QUESTION}回答済みです。`,
-        reason: "3回目以降のAPI送信と自動再回答を停止しました。",
+        reason: revealScheduled
+          ? "正解を表示して次回用に保存します。"
+          : "3回目以降のAPI送信と自動再回答を停止しました。",
         meta: "",
       });
       if (!isPaused(currentSettings)) {
-        setStatus("idle", `${question.label}: AI answer limit reached`, {
-          queueCount: taskQueue.length + activeRequests,
-        });
+        setStatus(
+          "idle",
+          revealScheduled
+            ? `${question.label}: opening the correct answer...`
+            : `${question.label}: AI answer limit reached`,
+          {
+            queueCount: taskQueue.length + activeRequests,
+          }
+        );
       }
       return;
     }
@@ -3264,6 +3495,45 @@ async function processQuestions() {
   ensureStatusWidget();
   const settings = await loadSettings();
 
+  const linguaportaRoot = document.querySelector(LINGUAPORTA_QUESTION_SELECTOR);
+  const revealedAnswer = extractLinguaportaRevealedCorrectAnswer(linguaportaRoot);
+  if (revealedAnswer) {
+    try {
+      const learned = await saveLearnedCorrectAnswer(revealedAnswer);
+      deferredScanRequested = false;
+      clearQueuedTasks();
+      cleanupPanels([]);
+      runtimeState.questionCount = 0;
+      runtimeState.readyCount = 0;
+      runtimeState.errorCount = 0;
+      const isAdvancing = scheduleLinguaportaAutoAdvance(linguaportaRoot, {
+        allowRevealedAnswer: true,
+      });
+      setStatus(
+        "ready",
+        [
+          learned?.saved
+            ? `Saved correct answer: ${learned.answer}`
+            : `Correct answer already saved: ${learned?.answer || revealedAnswer.answer}`,
+          isAdvancing
+            ? "Moving to the next problem..."
+            : "No next problem button found.",
+        ].join(" "),
+        {
+          questionCount: 0,
+          readyCount: 1,
+          errorCount: 0,
+          queueCount: activeRequests,
+          provider: "saved",
+          model: "correct-answer",
+        }
+      );
+      return;
+    } catch (error) {
+      console.warn("Failed to save the revealed Linguaporta answer:", error);
+    }
+  }
+
   setStatus("scanning", "Scanning page for quiz prompts...", {
     provider: "",
     model: "",
@@ -3277,7 +3547,6 @@ async function processQuestions() {
     return;
   }
 
-  const linguaportaRoot = document.querySelector(LINGUAPORTA_QUESTION_SELECTOR);
   if (isLinguaportaCorrectResult(linguaportaRoot)) {
     deferredScanRequested = false;
     clearQueuedTasks();
@@ -3453,6 +3722,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
       runtimeActionEpoch += 1;
       autoAdvanceScheduledKey = "";
       autoSubmittedButtons = new WeakSet();
+      autoRevealedButtons = new WeakSet();
     }
     deferredScanRequested = false;
     clearQueuedTasks();
@@ -3469,8 +3739,28 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request?.action !== "linguaportaContentPing") {
+    return false;
+  }
+
+  ensureStyles();
+  ensureStatusWidget();
+  loadSettings(true)
+    .then(() => {
+      syncStatusWidgetVisibility();
+      scheduleScan();
+      sendResponse({ ok: true });
+    })
+    .catch((error) => {
+      console.error("Failed to restore the content script UI:", error);
+      sendResponse({ ok: false });
+    });
+  return true;
+});
+
 const QUESTION_CONTENT_SELECTOR =
-  ".que, .qtext, .formulation, .subquestion, .answer, #problem-area, #question_area, #drill_form, #true_msg, #false_msg, .problem-next-group, .button-next-problem, .qu03_line, .DropLine, .CardStyle, audio, source, select, textarea";
+  ".que, .qtext, .formulation, .subquestion, .answer, #problem-area, #question_area, #drill_form, #true_msg, #false_msg, .problem-next-group, .button-next-problem, .qu03, .qu03_line, .DropLine, .CardStyle, audio, source, select, textarea";
 
 // Only a node that adds/removes real question content should trigger a rescan.
 // This ignores the quiz timer, autosave markers, tooltips, and our own panels,
