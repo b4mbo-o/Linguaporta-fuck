@@ -410,6 +410,18 @@
               <button type="button" class="provider-move-btn" data-provider-move="down" data-provider="openrouter">Down</button>
             </div>
           </div>
+          <div class="provider-item" data-provider-row data-provider="custom_llm">
+            <label class="provider-check">
+              <input id="providerCustomLlm" type="checkbox">
+              <span>Custom LLM (OpenAI-compatible)</span>
+            </label>
+            <span class="provider-warning" data-provider-warning></span>
+            <span class="provider-rank" data-provider-rank>OFF</span>
+            <div class="provider-move">
+              <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="custom_llm">Up</button>
+              <button type="button" class="provider-move-btn" data-provider-move="down" data-provider="custom_llm">Down</button>
+            </div>
+          </div>
         </div>
         <div class="toggle-note">Listening audio prefers Gemini when configured; if its quota is unavailable, OpenAI transcribes it and sends the transcript to Luna/Terra.</div>
         <div class="toggle">
@@ -443,6 +455,27 @@
             type="password"
             autocomplete="off"
             placeholder="Gemini API key (Google AI Studio)"
+          >
+          <input
+            id="customLlmEndpointInput"
+            class="api-key-input"
+            type="url"
+            autocomplete="off"
+            placeholder="Custom LLM endpoint (e.g. http://localhost:11434/v1/chat/completions)"
+          >
+          <input
+            id="customLlmModelInput"
+            class="api-key-input"
+            type="text"
+            autocomplete="off"
+            placeholder="Custom LLM model (e.g. llama3.2)"
+          >
+          <input
+            id="customLlmApiKeyInput"
+            class="api-key-input"
+            type="password"
+            autocomplete="off"
+            placeholder="Custom LLM API key (optional for local LLMs)"
           >
         </div>
         <div class="materials-actions">

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "LinguaportaFuck",
   "version": "1.0",
-  "description": "Linguaporta quiz helper using OpenAI, OpenRouter, and Gemini APIs.",
+  "description": "Linguaporta quiz helper using OpenAI, OpenRouter, Gemini, and custom OpenAI-compatible LLM APIs.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
     "https://api.openai.com/*",
@@ -10,6 +10,10 @@
     "https://generativelanguage.googleapis.com/*",
     "https://*.linguaporta.jp/*",
     "http://*.linguaporta.jp/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ],
   "action": {
     "default_popup": "popup.html",

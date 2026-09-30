@@ -8,16 +8,21 @@ const DEFAULT_SETTINGS = {
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
+  providerRevision: 0,
   apiProviders: ["openai", "gemini", "openrouter"],
   openaiApiKey: "",
   openrouterApiKey: "",
   geminiApiKey: "",
+  customLlmEndpoint: "",
+  customLlmModel: "",
+  customLlmApiKey: "",
   apiKey: "",
 };
 
 const PROVIDER_OPENAI = "openai";
 const PROVIDER_OPENROUTER = "openrouter";
 const PROVIDER_GEMINI = "gemini";
+const PROVIDER_CUSTOM_LLM = "custom_llm";
 const DEFAULT_PROVIDER_ORDER = [
   PROVIDER_OPENAI,
   PROVIDER_GEMINI,
@@ -27,11 +32,13 @@ const PROVIDER_DISPLAY_NAMES = {
   [PROVIDER_OPENAI]: "OpenAI",
   [PROVIDER_OPENROUTER]: "OpenRouter",
   [PROVIDER_GEMINI]: "Gemini",
+  [PROVIDER_CUSTOM_LLM]: "Custom LLM",
 };
 const ALL_PROVIDERS = [
   PROVIDER_OPENAI,
   PROVIDER_GEMINI,
   PROVIDER_OPENROUTER,
+  PROVIDER_CUSTOM_LLM,
 ];
 
 const MATERIAL_CONTEXT_LIMIT = 120000;
@@ -65,6 +72,7 @@ const providerListContainer = document.getElementById("providerList");
 const providerOpenAICheckbox = document.getElementById("providerOpenAI");
 const providerOpenRouterCheckbox = document.getElementById("providerOpenRouter");
 const providerGeminiCheckbox = document.getElementById("providerGemini");
+const providerCustomLlmCheckbox = document.getElementById("providerCustomLlm");
 const providerRows = Array.from(document.querySelectorAll("[data-provider-row]"));
 const providerMoveButtons = Array.from(
   document.querySelectorAll("[data-provider-move]")
@@ -72,6 +80,9 @@ const providerMoveButtons = Array.from(
 const openaiApiKeyInput = document.getElementById("openaiApiKeyInput");
 const openrouterApiKeyInput = document.getElementById("openrouterApiKeyInput");
 const geminiApiKeyInput = document.getElementById("geminiApiKeyInput");
+const customLlmEndpointInput = document.getElementById("customLlmEndpointInput");
+const customLlmModelInput = document.getElementById("customLlmModelInput");
+const customLlmApiKeyInput = document.getElementById("customLlmApiKeyInput");
 const saveApiKeyButton = document.getElementById("saveApiKeyButton");
 const clearApiKeyButton = document.getElementById("clearApiKeyButton");
 const apiKeyNote = document.getElementById("apiKeyNote");
@@ -94,6 +105,7 @@ function normalizeProviderOrder(value, options = {}) {
     PROVIDER_OPENAI,
     PROVIDER_OPENROUTER,
     PROVIDER_GEMINI,
+    PROVIDER_CUSTOM_LLM,
   ]);
   const seen = new Set();
   const normalized = [];
@@ -140,10 +152,14 @@ function normalizeSettings(raw = {}) {
     materialContext: typeof raw.materialContext === "string" ? raw.materialContext : "",
     materialSources,
     materialRevision: Number(raw.materialRevision) || 0,
+    providerRevision: Number(raw.providerRevision) || 0,
     apiProviders,
     openaiApiKey: String(raw.openaiApiKey || legacyApiKey).trim(),
     openrouterApiKey: String(raw.openrouterApiKey || "").trim(),
     geminiApiKey: String(raw.geminiApiKey || "").trim(),
+    customLlmEndpoint: String(raw.customLlmEndpoint || "").trim(),
+    customLlmModel: String(raw.customLlmModel || "").trim(),
+    customLlmApiKey: String(raw.customLlmApiKey || "").trim(),
   };
 }
 
@@ -391,6 +407,9 @@ function renderProviderPriority() {
   if (providerGeminiCheckbox) {
     providerGeminiCheckbox.checked = selectedSet.has(PROVIDER_GEMINI);
   }
+  if (providerCustomLlmCheckbox) {
+    providerCustomLlmCheckbox.checked = selectedSet.has(PROVIDER_CUSTOM_LLM);
+  }
   for (const providerId of orderedDisplayProviders) {
     const row = rowByProvider.get(providerId);
     if (!row) {
@@ -418,9 +437,20 @@ function renderProviderPriority() {
             ? openrouterApiKeyInput
             : providerId === PROVIDER_GEMINI
               ? geminiApiKeyInput
+              : providerId === PROVIDER_CUSTOM_LLM
+                ? null
               : null;
       const hasKey = !keyInput || Boolean(String(keyInput.value || "").trim());
-      warningElement.textContent = enabled && !hasKey ? "No API key" : "";
+      const customReady =
+        providerId !== PROVIDER_CUSTOM_LLM ||
+        (Boolean(String(customLlmEndpointInput?.value || "").trim()) &&
+          Boolean(String(customLlmModelInput?.value || "").trim()));
+      warningElement.textContent =
+        enabled && !customReady
+          ? "Endpoint/model required"
+          : enabled && !hasKey
+            ? "No API key"
+            : "";
     }
 
     const upButton = row.querySelector('[data-provider-move="up"]');
@@ -443,6 +473,8 @@ function renderApiKeySummary(settings) {
   const openaiKey = String(settings.openaiApiKey || "").trim();
   const openrouterKey = String(settings.openrouterApiKey || "").trim();
   const geminiKey = String(settings.geminiApiKey || "").trim();
+  const customEndpoint = String(settings.customLlmEndpoint || "").trim();
+  const customModel = String(settings.customLlmModel || "").trim();
 
   const lines = [
     `Order: ${
@@ -468,6 +500,11 @@ function renderApiKeySummary(settings) {
       ? `Gemini key: set (****${geminiKey.slice(-4)})`
       : "Gemini key: not set"
   );
+  lines.push(
+    customEndpoint && customModel
+      ? `Custom LLM: ${customModel} @ ${customEndpoint}`
+      : "Custom LLM: not configured"
+  );
   lines.push(`Free API mode: ${settings.freeApiMode ? "ON" : "OFF"}`);
   apiKeyNote.textContent = lines.join("\n");
 }
@@ -484,6 +521,9 @@ function render(settings) {
   openaiApiKeyInput.value = settings.openaiApiKey || "";
   openrouterApiKeyInput.value = settings.openrouterApiKey || "";
   geminiApiKeyInput.value = settings.geminiApiKey || "";
+  customLlmEndpointInput.value = settings.customLlmEndpoint || "";
+  customLlmModelInput.value = settings.customLlmModel || "";
+  customLlmApiKeyInput.value = settings.customLlmApiKey || "";
   // Must run after the key inputs are populated above — it reads their
   // live .value to decide whether to show a "No API key" warning.
   renderProviderPriority();
@@ -580,6 +620,13 @@ if (providerGeminiCheckbox) {
   });
 }
 
+if (providerCustomLlmCheckbox) {
+  providerCustomLlmCheckbox.addEventListener("change", () => {
+    setProviderEnabled(PROVIDER_CUSTOM_LLM, providerCustomLlmCheckbox.checked);
+    renderProviderPriority();
+  });
+}
+
 providerMoveButtons.forEach((button) => {
   button.addEventListener("click", () => {
     const providerId = String(button.dataset.provider || "").toLowerCase();
@@ -595,7 +642,14 @@ providerMoveButtons.forEach((button) => {
 
 // Refresh the "No API key" warnings live as the user types, before they hit
 // Save — otherwise a just-pasted key still shows the stale warning.
-[openaiApiKeyInput, openrouterApiKeyInput, geminiApiKeyInput].forEach((input) => {
+[
+  openaiApiKeyInput,
+  openrouterApiKeyInput,
+  geminiApiKeyInput,
+  customLlmEndpointInput,
+  customLlmModelInput,
+  customLlmApiKeyInput,
+].forEach((input) => {
   if (input) {
     input.addEventListener("input", () => renderProviderPriority());
   }
@@ -614,12 +668,54 @@ async function saveProviderSettings(noteOnSuccess) {
   const openaiApiKey = String(openaiApiKeyInput.value || "").trim();
   const openrouterApiKey = String(openrouterApiKeyInput.value || "").trim();
   const geminiApiKey = String(geminiApiKeyInput.value || "").trim();
+  const customLlmEndpoint = String(customLlmEndpointInput.value || "").trim();
+  const customLlmModel = String(customLlmModelInput.value || "").trim();
+  const customLlmApiKey = String(customLlmApiKeyInput.value || "").trim();
+  let customLlmOriginPattern = "";
+
+  if (
+    providers.includes(PROVIDER_CUSTOM_LLM) &&
+    (!customLlmEndpoint || !customLlmModel)
+  ) {
+    apiKeyNote.textContent = "Custom LLM requires both an endpoint and model.";
+    return false;
+  }
+
+  if (customLlmEndpoint) {
+    try {
+      const parsedEndpoint = new URL(customLlmEndpoint);
+      if (!/^https?:$/.test(parsedEndpoint.protocol)) {
+        throw new Error("Unsupported protocol");
+      }
+      customLlmOriginPattern = `${parsedEndpoint.origin}/*`;
+    } catch (_error) {
+      apiKeyNote.textContent = "Custom LLM endpoint must be a valid HTTP(S) URL.";
+      return false;
+    }
+  }
+
+  if (providers.includes(PROVIDER_CUSTOM_LLM) && customLlmOriginPattern) {
+    const permissionGranted = await new Promise((resolve) => {
+      chrome.permissions.request(
+        { origins: [customLlmOriginPattern] },
+        (granted) => resolve(Boolean(granted) && !chrome.runtime.lastError)
+      );
+    });
+    if (!permissionGranted) {
+      apiKeyNote.textContent = "Custom LLM host permission was not granted.";
+      return false;
+    }
+  }
 
   await saveSettings({
     apiProviders: providers,
     openaiApiKey,
     openrouterApiKey,
     geminiApiKey,
+    customLlmEndpoint,
+    customLlmModel,
+    customLlmApiKey,
+    providerRevision: Date.now(),
     apiKey: openaiApiKey,
   });
   apiKeyNote.textContent = noteOnSuccess || "API settings saved.";
@@ -636,11 +732,18 @@ clearApiKeyButton.addEventListener("click", async () => {
     openaiApiKey: "",
     openrouterApiKey: "",
     geminiApiKey: "",
+    customLlmEndpoint: "",
+    customLlmModel: "",
+    customLlmApiKey: "",
+    providerRevision: Date.now(),
     apiKey: "",
   });
   openaiApiKeyInput.value = "";
   openrouterApiKeyInput.value = "";
   geminiApiKeyInput.value = "";
+  customLlmEndpointInput.value = "";
+  customLlmModelInput.value = "";
+  customLlmApiKeyInput.value = "";
   apiKeyNote.textContent = "API keys cleared.";
   await refresh();
 });
@@ -845,9 +948,13 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "materialSources",
     "materialRevision",
     "apiProviders",
+    "providerRevision",
     "openaiApiKey",
     "openrouterApiKey",
     "geminiApiKey",
+    "customLlmEndpoint",
+    "customLlmModel",
+    "customLlmApiKey",
     "apiKey",
   ];
 

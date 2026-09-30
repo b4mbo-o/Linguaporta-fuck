@@ -14,8 +14,14 @@ const MAX_IMAGES_PER_QUESTION = 4;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 const MAX_AUDIO_FILES_PER_QUESTION = 1;
 const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
-const SOL_RETRY_GUARD_STORAGE_KEY = "linguaportaSolRetryGuards";
-const SOL_RETRY_GUARD_TTL_MS = 30 * 60 * 1000;
+const RETRY_SUBMIT_GUARD_STORAGE_KEY = "linguaportaSolRetryGuards";
+const RETRY_SUBMIT_GUARD_TTL_MS = 30 * 60 * 1000;
+// V2 excludes provider-chain failures from the two-answer limit. A new key
+// prevents failures recorded by the older behavior from blocking a retry.
+const AI_ANSWER_ATTEMPTS_STORAGE_KEY = "linguaportaAiAnswerAttemptsV2";
+const AI_ANSWER_ATTEMPT_TTL_MS = 30 * 60 * 1000;
+const MAX_AI_ANSWERS_PER_QUESTION = 2;
+const AI_ANSWER_LIMIT_ERROR_CODE = "AI_ANSWER_LIMIT_REACHED";
 
 const answerCache = new Map();
 const imageDataUrlCache = new Map();
@@ -29,7 +35,8 @@ let deferredScanRequested = false;
 let autoAdvanceScheduledKey = "";
 let autoSubmittedButtons = new WeakSet();
 let runtimeActionEpoch = 0;
-const solRetryReservations = new Set();
+const retrySubmitReservations = new Set();
+const aiAttemptReservationChains = new Map();
 
 const runtimeState = {
   phase: "booting",
@@ -51,6 +58,7 @@ const DEFAULT_SETTINGS = {
   materialMode: false,
   freeApiMode: false,
   materialRevision: 0,
+  providerRevision: 0,
 };
 
 let currentSettings = { ...DEFAULT_SETTINGS };
@@ -72,6 +80,7 @@ function normalizeSettings(raw = {}) {
     materialMode: Boolean(raw.materialMode),
     freeApiMode: Boolean(raw.freeApiMode),
     materialRevision: Number(raw.materialRevision) || 0,
+    providerRevision: Number(raw.providerRevision) || 0,
   };
 }
 
@@ -83,6 +92,7 @@ function getRequestCacheKey(question, settings = currentSettings) {
     materialMode: Boolean(settings.materialMode),
     freeApiMode: Boolean(settings.freeApiMode),
     materialRevision: Number(settings.materialRevision) || 0,
+    providerRevision: Number(settings.providerRevision) || 0,
   });
 }
 
@@ -1125,47 +1135,212 @@ function findLinguaportaAnswerButton(questionRoot, allowRetry = false) {
   return allowRetry && label === "もう一度解答する" ? button : null;
 }
 
-function getSolRetryFingerprint(question) {
-  const stableQuestion = JSON.stringify({
-    questionText: normalizeText(question?.questionText || ""),
-    options: Array.isArray(question?.options)
-      ? question.options.map((option) => normalizeText(option))
-      : [],
-    targetType: normalizeText(question?.targetType || "standard"),
-  });
+function hashStableQuestion(value) {
+  const text = String(value || "");
   let hash = 2166136261;
-  for (let index = 0; index < stableQuestion.length; index += 1) {
-    hash ^= stableQuestion.charCodeAt(index);
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
 }
 
-function reserveSolAutoRetry(question) {
-  const fingerprint = getSolRetryFingerprint(question);
-  if (solRetryReservations.has(fingerprint)) {
+function getAiAnswerFingerprint(question) {
+  const stableQuestion = JSON.stringify({
+    questionText: normalizeText(
+      question?.groupMarkedText ||
+        question?.markedText ||
+        question?.questionText ||
+        ""
+    ),
+    options: Array.isArray(question?.options)
+      ? question.options.map((option) => normalizeText(option))
+      : [],
+    blanks: Array.isArray(question?.blanks)
+      ? question.blanks.map((blank) => ({
+          label: normalizeText(blank?.label || ""),
+          options: Array.isArray(blank?.options)
+            ? blank.options.map((option) => normalizeText(option))
+            : [],
+        }))
+      : Array.isArray(question?.groupBlanks)
+        ? question.groupBlanks.map((blank) => ({
+            label: normalizeText(blank?.label || ""),
+            fieldType: normalizeText(blank?.fieldType || ""),
+          }))
+        : [],
+    targetType: normalizeText(question?.targetType || "standard"),
+  });
+  return hashStableQuestion(stableQuestion);
+}
+
+function getRetrySubmitFingerprint(question) {
+  return getAiAnswerFingerprint(question);
+}
+
+function createAiAnswerLimitError() {
+  const error = new Error(
+    `AI回答は同じ問題につき${MAX_AI_ANSWERS_PER_QUESTION}回までです。`
+  );
+  error.code = AI_ANSWER_LIMIT_ERROR_CODE;
+  return error;
+}
+
+function reserveAiAnswerAttempt(question) {
+  const fingerprint = getAiAnswerFingerprint(question);
+  const previous = aiAttemptReservationChains.get(fingerprint) || Promise.resolve();
+  const reservation = previous
+    .catch(() => undefined)
+    .then(
+      () =>
+        new Promise((resolve, reject) => {
+          chrome.storage.local.get(
+            { [AI_ANSWER_ATTEMPTS_STORAGE_KEY]: {} },
+            (items) => {
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+                return;
+              }
+
+              const now = Date.now();
+              const storedAttempts = items?.[AI_ANSWER_ATTEMPTS_STORAGE_KEY];
+              const attempts =
+                storedAttempts &&
+                typeof storedAttempts === "object" &&
+                !Array.isArray(storedAttempts)
+                  ? { ...storedAttempts }
+                  : {};
+
+              for (const [key, entry] of Object.entries(attempts)) {
+                const updatedAt = Number(entry?.updatedAt || 0);
+                if (!updatedAt || now - updatedAt > AI_ANSWER_ATTEMPT_TTL_MS) {
+                  delete attempts[key];
+                }
+              }
+
+              const currentCount = Math.max(
+                0,
+                Number(attempts[fingerprint]?.count || 0)
+              );
+              if (currentCount >= MAX_AI_ANSWERS_PER_QUESTION) {
+                reject(createAiAnswerLimitError());
+                return;
+              }
+
+              // Persist the reservation before contacting the model. A form
+              // submission can navigate immediately, so a reload must already
+              // know that this generation consumed one of the two attempts.
+              attempts[fingerprint] = {
+                count: currentCount + 1,
+                updatedAt: now,
+              };
+              chrome.storage.local.set(
+                { [AI_ANSWER_ATTEMPTS_STORAGE_KEY]: attempts },
+                () => {
+                  if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                    return;
+                  }
+                  resolve(currentCount + 1);
+                }
+              );
+            }
+          );
+        })
+    );
+
+  aiAttemptReservationChains.set(fingerprint, reservation);
+  return reservation.finally(() => {
+    if (aiAttemptReservationChains.get(fingerprint) === reservation) {
+      aiAttemptReservationChains.delete(fingerprint);
+    }
+  });
+}
+
+function releaseAiAnswerAttempt(question) {
+  const fingerprint = getAiAnswerFingerprint(question);
+  const previous = aiAttemptReservationChains.get(fingerprint) || Promise.resolve();
+  const release = previous
+    .catch(() => undefined)
+    .then(
+      () =>
+        new Promise((resolve, reject) => {
+          chrome.storage.local.get(
+            { [AI_ANSWER_ATTEMPTS_STORAGE_KEY]: {} },
+            (items) => {
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+                return;
+              }
+
+              const storedAttempts = items?.[AI_ANSWER_ATTEMPTS_STORAGE_KEY];
+              const attempts =
+                storedAttempts &&
+                typeof storedAttempts === "object" &&
+                !Array.isArray(storedAttempts)
+                  ? { ...storedAttempts }
+                  : {};
+              const currentCount = Math.max(
+                0,
+                Number(attempts[fingerprint]?.count || 0)
+              );
+              if (currentCount <= 1) {
+                delete attempts[fingerprint];
+              } else {
+                attempts[fingerprint] = {
+                  count: currentCount - 1,
+                  updatedAt: Date.now(),
+                };
+              }
+
+              chrome.storage.local.set(
+                { [AI_ANSWER_ATTEMPTS_STORAGE_KEY]: attempts },
+                () => {
+                  if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                    return;
+                  }
+                  resolve();
+                }
+              );
+            }
+          );
+        })
+    );
+
+  aiAttemptReservationChains.set(fingerprint, release);
+  return release.finally(() => {
+    if (aiAttemptReservationChains.get(fingerprint) === release) {
+      aiAttemptReservationChains.delete(fingerprint);
+    }
+  });
+}
+
+function reserveRetryAutoSubmit(question) {
+  const fingerprint = getRetrySubmitFingerprint(question);
+  if (retrySubmitReservations.has(fingerprint)) {
     return Promise.resolve(false);
   }
-  solRetryReservations.add(fingerprint);
+  retrySubmitReservations.add(fingerprint);
 
   return new Promise((resolve) => {
     chrome.storage.local.get(
-      { [SOL_RETRY_GUARD_STORAGE_KEY]: {} },
+      { [RETRY_SUBMIT_GUARD_STORAGE_KEY]: {} },
       (items) => {
         if (chrome.runtime.lastError) {
-          solRetryReservations.delete(fingerprint);
+          retrySubmitReservations.delete(fingerprint);
           resolve(false);
           return;
         }
 
         const now = Date.now();
-        const storedGuards = items?.[SOL_RETRY_GUARD_STORAGE_KEY];
+        const storedGuards = items?.[RETRY_SUBMIT_GUARD_STORAGE_KEY];
         const guards =
           storedGuards && typeof storedGuards === "object" && !Array.isArray(storedGuards)
             ? { ...storedGuards }
             : {};
         for (const [key, timestamp] of Object.entries(guards)) {
-          if (now - Number(timestamp) > SOL_RETRY_GUARD_TTL_MS) {
+          if (now - Number(timestamp) > RETRY_SUBMIT_GUARD_TTL_MS) {
             delete guards[key];
           }
         }
@@ -1179,10 +1354,10 @@ function reserveSolAutoRetry(question) {
         // next page must already know this question consumed its one retry.
         guards[fingerprint] = now;
         chrome.storage.local.set(
-          { [SOL_RETRY_GUARD_STORAGE_KEY]: guards },
+          { [RETRY_SUBMIT_GUARD_STORAGE_KEY]: guards },
           () => {
             if (chrome.runtime.lastError) {
-              solRetryReservations.delete(fingerprint);
+              retrySubmitReservations.delete(fingerprint);
               resolve(false);
               return;
             }
@@ -1204,18 +1379,18 @@ async function scheduleLinguaportaAutoSubmit(question, result = {}) {
   }
 
   const isIncorrect = isLinguaportaIncorrectResult(questionRoot);
-  const isSolRetry =
+  const isAiRetry =
     isIncorrect &&
-    normalizeText(result.provider).toLowerCase() === "openai" &&
-    normalizeText(result.model).toLowerCase() === "gpt-5.6-sol";
-  if (isIncorrect && !isSolRetry) {
+    Boolean(normalizeText(result.provider)) &&
+    Boolean(normalizeText(result.model));
+  if (isIncorrect && !isAiRetry) {
     return false;
   }
-  if (isSolRetry && !(await reserveSolAutoRetry(question))) {
+  if (isAiRetry && !(await reserveRetryAutoSubmit(question))) {
     return false;
   }
 
-  const answerButton = findLinguaportaAnswerButton(questionRoot, isSolRetry);
+  const answerButton = findLinguaportaAnswerButton(questionRoot, isAiRetry);
   if (!answerButton || autoSubmittedButtons.has(answerButton)) {
     return false;
   }
@@ -1228,7 +1403,7 @@ async function scheduleLinguaportaAutoSubmit(question, result = {}) {
       isPaused(currentSettings) ||
       !questionRoot.isConnected ||
       isLinguaportaCorrectResult(questionRoot) ||
-      findLinguaportaAnswerButton(questionRoot, isSolRetry) !== answerButton
+      findLinguaportaAnswerButton(questionRoot, isAiRetry) !== answerButton
     ) {
       return;
     }
@@ -1452,6 +1627,22 @@ function getChoiceTargetType(questionRoot) {
   }
 
   if (isLinguaportaQuestionRoot(questionRoot)) {
+    // Some Linguaporta templates place auxiliary radio/select controls in the
+    // same form as a real free-text blank (notably listening exercises). The
+    // free-text field is the answer target in that layout; treating the whole
+    // form as multiple choice makes valid words such as "national" fail the
+    // option-membership validator and unnecessarily fall through providers.
+    const hasEditableTextAnswer = Boolean(
+      answerRoot.querySelector(
+        "input[type='text']:not([disabled]):not([readonly]), " +
+          "input[type='number']:not([disabled]):not([readonly]), " +
+          "textarea:not([disabled]):not([readonly])"
+      )
+    );
+    if (hasEditableTextAnswer) {
+      return "";
+    }
+
     const checkboxes = answerRoot.querySelectorAll("input[type='checkbox']");
     if (checkboxes.length) {
       return "multiple_choice";
@@ -2570,8 +2761,11 @@ function requestAnswer(question) {
     return pendingAnswers.get(cacheKey);
   }
 
-  const promise = new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
+  const promise = (async () => {
+    await reserveAiAnswerAttempt(question);
+    try {
+      return await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
       {
         action: "getAnswer",
         question: question.questionText,
@@ -2618,8 +2812,15 @@ function requestAnswer(question) {
         answerCache.set(cacheKey, result);
         resolve(result);
       }
-    );
-  }).finally(() => {
+        );
+      });
+    } catch (error) {
+      await releaseAiAnswerAttempt(question).catch((releaseError) => {
+        console.warn("Failed to release unsuccessful AI attempt:", releaseError);
+      });
+      throw error;
+    }
+  })().finally(() => {
     pendingAnswers.delete(cacheKey);
   });
 
@@ -2689,8 +2890,11 @@ function requestGapfillAnswer(question) {
     return pendingAnswers.get(cacheKey);
   }
 
-  const promise = new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
+  const promise = (async () => {
+    await reserveAiAnswerAttempt(question);
+    try {
+      return await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
       {
         action: "getAnswer",
         question: question.markedText,
@@ -2738,8 +2942,15 @@ function requestGapfillAnswer(question) {
         answerCache.set(cacheKey, result);
         resolve(result);
       }
-    );
-  }).finally(() => {
+        );
+      });
+    } catch (error) {
+      await releaseAiAnswerAttempt(question).catch((releaseError) => {
+        console.warn("Failed to release unsuccessful AI attempt:", releaseError);
+      });
+      throw error;
+    }
+  })().finally(() => {
     pendingAnswers.delete(cacheKey);
   });
 
@@ -2798,8 +3009,11 @@ function requestGroupBlankAnswers(question) {
     return pendingAnswers.get(cacheKey);
   }
 
-  const promise = new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
+  const promise = (async () => {
+    await reserveAiAnswerAttempt(question);
+    try {
+      return await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
       {
         action: "getAnswer",
         question: question.groupMarkedText,
@@ -2844,8 +3058,15 @@ function requestGroupBlankAnswers(question) {
         answerCache.set(cacheKey, result);
         resolve(result);
       }
-    );
-  }).finally(() => {
+        );
+      });
+    } catch (error) {
+      await releaseAiAnswerAttempt(question).catch((releaseError) => {
+        console.warn("Failed to release unsuccessful AI attempt:", releaseError);
+      });
+      throw error;
+    }
+  })().finally(() => {
     pendingAnswers.delete(cacheKey);
   });
 
@@ -2983,6 +3204,23 @@ async function hydratePanel(question, panel, options = {}) {
     }
   } catch (error) {
     console.error("Failed to fetch answer:", error);
+    const answerLimitReached = error?.code === AI_ANSWER_LIMIT_ERROR_CODE;
+    if (answerLimitReached) {
+      panel.dataset.loadedKey = loadKey;
+      updatePanel(panel, {
+        state: "limit",
+        status: "Stopped",
+        answer: `この問題はAIで${MAX_AI_ANSWERS_PER_QUESTION}回答済みです。`,
+        reason: "3回目以降のAPI送信と自動再回答を停止しました。",
+        meta: "",
+      });
+      if (!isPaused(currentSettings)) {
+        setStatus("idle", `${question.label}: AI answer limit reached`, {
+          queueCount: taskQueue.length + activeRequests,
+        });
+      }
+      return;
+    }
     runtimeState.errorCount += 1;
     updatePanel(panel, {
       state: "error",
@@ -3194,7 +3432,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     nextSettings.materialMode !== currentSettings.materialMode ||
     nextSettings.materialRevision !== currentSettings.materialRevision;
   const apiModeChanged =
-    nextSettings.freeApiMode !== currentSettings.freeApiMode;
+    nextSettings.freeApiMode !== currentSettings.freeApiMode ||
+    nextSettings.providerRevision !== currentSettings.providerRevision;
   const availabilityChanged =
     nextSettings.enabled !== currentSettings.enabled ||
     nextSettings.pausedUntil !== currentSettings.pausedUntil;

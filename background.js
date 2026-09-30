@@ -1,6 +1,7 @@
 const PROVIDER_OPENAI = "openai";
 const PROVIDER_OPENROUTER = "openrouter";
 const PROVIDER_GEMINI = "gemini";
+const PROVIDER_CUSTOM_LLM = "custom_llm";
 const OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
 const OPENAI_TRANSCRIPTION_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_TRANSCRIPTION_MODEL = "gpt-transcribe";
@@ -97,6 +98,9 @@ const MATERIAL_DEFAULTS = {
   openaiApiKey: "",
   openrouterApiKey: "",
   geminiApiKey: "",
+  customLlmEndpoint: "",
+  customLlmModel: "",
+  customLlmApiKey: "",
   apiKey: "",
 };
 
@@ -678,7 +682,9 @@ function buildRequestHeaders(providerId, credentials) {
   const rawKey =
     providerId === PROVIDER_OPENROUTER
       ? normalizeText(credentials?.openrouterApiKey)
-      : normalizeText(credentials?.openaiApiKey);
+      : providerId === PROVIDER_CUSTOM_LLM
+        ? normalizeText(credentials?.customLlmApiKey)
+        : normalizeText(credentials?.openaiApiKey);
 
   if (!rawKey) {
     return headers;
@@ -715,6 +721,7 @@ function normalizeProviderOrder(providers) {
     PROVIDER_OPENAI,
     PROVIDER_OPENROUTER,
     PROVIDER_GEMINI,
+    PROVIDER_CUSTOM_LLM,
   ]);
   const seen = new Set();
   const normalized = [];
@@ -759,7 +766,9 @@ function getModelChain(
   modelPolicy = {}
 ) {
   if (providerId === PROVIDER_OPENROUTER) {
-    const useDetailedProfile = Boolean(modelPolicy?.detailedMode);
+    const useDetailedProfile = Boolean(
+      modelPolicy?.detailedMode || modelPolicy?.preferOpenAiSol
+    );
     const freeApiMode = Boolean(modelPolicy?.freeApiMode);
     // Only escalate past flash-lite on the paid chain — the free OpenRouter
     // models are unaffected by image content.
@@ -809,11 +818,18 @@ function getModelChain(
     return dedupeModels(GEMINI_STANDARD_MODEL_IDS);
   }
 
-  if (modelPolicy?.preferOpenAiSol) {
-    return [OPENAI_SOL_MODEL_ID];
+  if (providerId === PROVIDER_CUSTOM_LLM) {
+    return dedupeModels([modelPolicy?.customLlmModel]);
   }
 
-  return dedupeModels(OPENAI_MODEL_IDS);
+  if (providerId === PROVIDER_OPENAI) {
+    if (modelPolicy?.preferOpenAiSol) {
+      return [OPENAI_SOL_MODEL_ID];
+    }
+    return dedupeModels(OPENAI_MODEL_IDS);
+  }
+
+  return [];
 }
 
 function buildProviderModelPlans(
@@ -857,6 +873,15 @@ function filterProvidersByCredentials(providerOrder, credentials) {
     if (
       providerId === PROVIDER_GEMINI &&
       normalizeText(credentials?.geminiApiKey)
+    ) {
+      available.push(providerId);
+      continue;
+    }
+
+    if (
+      providerId === PROVIDER_CUSTOM_LLM &&
+      normalizeText(credentials?.customLlmEndpoint) &&
+      normalizeText(credentials?.customLlmModel)
     ) {
       available.push(providerId);
     }
@@ -1099,6 +1124,7 @@ function buildQuizPrompt(
     ? options.map((option) => normalizeText(option)).filter(Boolean)
     : [];
   const answerMode = detectAnswerMode(question, cleanedOptions, targetType);
+  const isContextualBlank = question.includes("[blank]");
   const relevantMaterialReference = buildMaterialReference(
     question,
     cleanedOptions,
@@ -1113,8 +1139,25 @@ function buildQuizPrompt(
     "Do not add explanations or reasons.",
   ];
 
-  if (question.includes("[blank]")) {
+  if (isContextualBlank) {
     instructions.push("The text contains one [blank] marker.");
+    instructions.push(
+      "Treat the complete text before and after [blank] as one sentence or passage; never guess from the blank alone."
+    );
+    instructions.push(
+      "Before answering, silently reconstruct the full sentence with each plausible answer and choose the one that is both grammatically correct and most natural in meaning."
+    );
+    instructions.push(
+      "Check tense, subject-verb agreement, singular/plural form, articles, prepositions, word order, collocation, and semantic consistency with the surrounding sentences."
+    );
+    instructions.push(
+      "If a Japanese instruction or translation is present, use it as an additional meaning constraint, but keep the completed English sentence natural."
+    );
+    if (cleanedOptions.length) {
+      instructions.push(
+        "Test every listed choice inside the full sentence before selecting the best fit; do not choose merely because a word appears related to the topic."
+      );
+    }
     instructions.push("Return only the exact word(s) that replace [blank], nothing else.");
     instructions.push("Do not rewrite or repeat the whole sentence or expression.");
     instructions.push(
@@ -1239,6 +1282,7 @@ function buildRequestPlans(
   images = []
 ) {
   const answerMode = detectAnswerMode(question, options, targetType);
+  const isContextualBlank = question.includes("[blank]");
   const hasMaterial = Boolean(normalizeMaterialContext(materialContext));
   const effectiveDetailedMode = detailedMode || useAccuracyProfile;
   const hasImages = Boolean(images.length);
@@ -1279,8 +1323,14 @@ function buildRequestPlans(
     maxTokens + numberExpressionBonus,
     orderingTokenBudget,
     multipleChoiceTokenBudget,
+    isContextualBlank ? 128 : 0,
     hasImages ? IMAGE_QUESTION_MIN_TOKENS : 0
   );
+  const allowReasoning =
+    effectiveDetailedMode ||
+    hasImages ||
+    answerMode === "number" ||
+    isContextualBlank;
   const effectiveModelPolicy = {
     ...modelPolicy,
     detailedMode: effectiveDetailedMode,
@@ -1325,7 +1375,7 @@ function buildRequestPlans(
       ),
       maxTokens: safeMaxTokens,
       images,
-      allowThinking: effectiveDetailedMode || hasImages || answerMode === "number",
+      allowThinking: allowReasoning,
     })),
     ...fallbackPlans.map((plan) => ({
       providerId: plan.providerId,
@@ -1341,7 +1391,7 @@ function buildRequestPlans(
       ),
       maxTokens: safeMaxTokens,
       images,
-      allowThinking: effectiveDetailedMode || hasImages || answerMode === "number",
+      allowThinking: allowReasoning,
     })),
   ];
 }
@@ -1357,6 +1407,9 @@ function loadMaterialState() {
       const openaiApiKey = normalizeText(items.openaiApiKey || legacyApiKey);
       const openrouterApiKey = normalizeText(items.openrouterApiKey);
       const geminiApiKey = normalizeText(items.geminiApiKey);
+      const customLlmEndpoint = normalizeText(items.customLlmEndpoint);
+      const customLlmModel = normalizeText(items.customLlmModel);
+      const customLlmApiKey = normalizeText(items.customLlmApiKey);
       const apiProviders = normalizeProviderOrder(items.apiProviders);
       const materialContext = materialMode
         ? normalizeMaterialContext(items.materialContext).slice(
@@ -1379,6 +1432,9 @@ function loadMaterialState() {
         openaiApiKey,
         openrouterApiKey,
         geminiApiKey,
+        customLlmEndpoint,
+        customLlmModel,
+        customLlmApiKey,
       });
     });
   });
@@ -2112,7 +2168,7 @@ function isLikelyInvalidAnswer(answer, question, options, targetType = "standard
 
   return false;
 }
-function getProviderEndpoints(providerId, model = "") {
+function getProviderEndpoints(providerId, model = "", credentials = {}) {
   if (providerId === PROVIDER_OPENROUTER) {
     return [OPENROUTER_ENDPOINT];
   }
@@ -2122,6 +2178,22 @@ function getProviderEndpoints(providerId, model = "") {
     return [
       `${GEMINI_ENDPOINT_BASE}/${encodeURIComponent(modelId)}:generateContent`,
     ];
+  }
+
+  if (providerId === PROVIDER_CUSTOM_LLM) {
+    const endpoint = normalizeText(credentials?.customLlmEndpoint);
+    if (!endpoint) {
+      return [];
+    }
+    try {
+      const parsed = new URL(endpoint);
+      if (!/^https?:$/.test(parsed.protocol)) {
+        return [];
+      }
+      return [parsed.toString()];
+    } catch (_error) {
+      return [];
+    }
   }
 
   return [OPENAI_ENDPOINT];
@@ -2134,6 +2206,10 @@ function getProviderLabel(providerId) {
 
   if (providerId === PROVIDER_GEMINI) {
     return "Gemini";
+  }
+
+  if (providerId === PROVIDER_CUSTOM_LLM) {
+    return "Custom LLM";
   }
 
   return "OpenAI";
@@ -2204,7 +2280,10 @@ async function requestChatCompletion(
 
   let lastError = null;
   const providerLabel = getProviderLabel(providerId);
-  const endpointCandidates = getProviderEndpoints(providerId, model);
+  const endpointCandidates = getProviderEndpoints(providerId, model, credentials);
+  if (!endpointCandidates.length) {
+    throw new Error(`${providerLabel} endpoint is not configured or invalid.`);
+  }
   const maxAttempts = isOpenRouterFreeRequest
     ? Math.min(REQUEST_MAX_ATTEMPTS, OPENROUTER_FREE_MODEL_MAX_ATTEMPTS)
     : REQUEST_MAX_ATTEMPTS;
@@ -2295,7 +2374,11 @@ async function requestChatCompletion(
       delete payload.max_tokens;
       delete payload.temperature;
       payload.max_completion_tokens = attemptMaxTokens;
-      payload.reasoning_effort = isOpenAiSol ? "medium" : "none";
+      payload.reasoning_effort = isOpenAiSol
+        ? "medium"
+        : allowThinking
+          ? "low"
+          : "none";
     }
 
     let shouldRetryAttempt = false;
@@ -2463,6 +2546,7 @@ async function buildModelPolicy(providerOrder, credentials) {
   const policy = {
     freeApiMode: Boolean(credentials?.freeApiMode),
     openRouterBudgetMode: "free_then_paid",
+    customLlmModel: normalizeText(credentials?.customLlmModel),
   };
 
   if (!normalizedProviders.includes(PROVIDER_OPENROUTER)) {
@@ -2509,31 +2593,20 @@ async function callAiChat(
   const cleanedImages = sanitizeImages(images);
   const cleanedAudios = sanitizeAudios(audios);
   const normalizedProviderOrder = normalizeProviderOrder(providerOrder);
-  const solProviderOrder =
-    preferOpenAiSol && normalizedProviderOrder.includes(PROVIDER_OPENAI)
-      ? [
-          PROVIDER_OPENAI,
-          ...normalizedProviderOrder.filter(
-            (providerId) => providerId !== PROVIDER_OPENAI
-          ),
-        ]
-      : normalizedProviderOrder;
   // Listening exercises prefer Gemini whenever its configured key survived
   // credential filtering. Gemini can read the audio directly with its free
   // tier; quota/rate-limit failures still fall through to the user's normal
   // provider order, where OpenAI can transcribe the audio as a fallback.
-  const effectiveProviderOrder = preferOpenAiSol
-    ? solProviderOrder
-    : cleanedAudios.length
+  const effectiveProviderOrder = cleanedAudios.length
     ? [
-        ...solProviderOrder.filter(
+        ...normalizedProviderOrder.filter(
           (providerId) => providerId === PROVIDER_GEMINI
         ),
-        ...solProviderOrder.filter(
+        ...normalizedProviderOrder.filter(
           (providerId) => providerId !== PROVIDER_GEMINI
         ),
       ]
-    : solProviderOrder;
+    : normalizedProviderOrder;
   const modelPolicy = {
     ...(await buildModelPolicy(effectiveProviderOrder, credentials)),
     preferOpenAiSol: Boolean(preferOpenAiSol),
@@ -2743,6 +2816,10 @@ function buildGapfillPrompt(markedText, blanks) {
   const instructions = [
     "Fill every numbered blank in the sentence below.",
     "Each blank is written as [1], [2], and so on.",
+    "Use the complete text before and after every blank. Do not solve a blank from a nearby keyword alone.",
+    "Silently reconstruct the whole sentence or passage with the candidate choices and select the combination that is grammatically correct and most natural in meaning.",
+    "Check tense, subject-verb agreement, singular/plural form, articles, prepositions, word order, collocations, and consistency between surrounding sentences.",
+    "If Japanese instructions or a Japanese translation are present, use them as an additional meaning constraint without making the completed English unnatural.",
     "For each blank choose the single best option from that blank's own choice list, copied character-for-character.",
     "The blanks are related to each other (e.g. an opening tag and its matching closing tag), so decide all of them together so the whole sentence makes sense as one unit.",
     'Output exactly one line per blank in the form "N: answer" — for example "1: canvas".',
@@ -2818,15 +2895,7 @@ async function callGapfillChat(
 
   const cleanedText = normalizeText(markedText);
   const cleanedImages = sanitizeImages(images);
-  const effectiveProviderOrder =
-    preferOpenAiSol && normalizeProviderOrder(providerOrder).includes(PROVIDER_OPENAI)
-      ? [
-          PROVIDER_OPENAI,
-          ...normalizeProviderOrder(providerOrder).filter(
-            (providerId) => providerId !== PROVIDER_OPENAI
-          ),
-        ]
-      : normalizeProviderOrder(providerOrder);
+  const effectiveProviderOrder = normalizeProviderOrder(providerOrder);
   const modelPolicy = {
     ...(await buildModelPolicy(effectiveProviderOrder, credentials)),
     preferOpenAiSol: Boolean(preferOpenAiSol),
@@ -2870,7 +2939,7 @@ async function callGapfillChat(
   }
 
   const prompt = buildGapfillPrompt(cleanedText, blanks);
-  const maxTokens = Math.max(64, blanks.length * 24 + 24);
+  const maxTokens = Math.max(128, blanks.length * 32 + 32);
 
   let lastError = null;
   let lastFailureSummary = "";
@@ -2893,7 +2962,9 @@ async function callGapfillChat(
         credentials,
         {
           images: cleanedImages,
-          allowThinking: effectiveDetailedMode || hasImages,
+          // Choosing a word from context requires comparing every candidate in
+          // the complete sentence, even when the global detailed mode is off.
+          allowThinking: true,
         }
       );
       const answers = parseGapfillAnswers(response.answer, blanks);
@@ -3137,15 +3208,7 @@ async function callMultiBlankChat(
 
   const cleanedText = normalizeText(markedText);
   const cleanedImages = sanitizeImages(images);
-  const effectiveProviderOrder =
-    preferOpenAiSol && normalizeProviderOrder(providerOrder).includes(PROVIDER_OPENAI)
-      ? [
-          PROVIDER_OPENAI,
-          ...normalizeProviderOrder(providerOrder).filter(
-            (providerId) => providerId !== PROVIDER_OPENAI
-          ),
-        ]
-      : normalizeProviderOrder(providerOrder);
+  const effectiveProviderOrder = normalizeProviderOrder(providerOrder);
   const modelPolicy = {
     ...(await buildModelPolicy(effectiveProviderOrder, credentials)),
     preferOpenAiSol: Boolean(preferOpenAiSol),
@@ -3356,7 +3419,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
       if (!activeProviders.length) {
         throw new Error(
-          "No usable API provider is configured. Enable OpenAI/OpenRouter/Gemini and set the required API keys in the popup."
+          "No usable API provider is configured. Enable OpenAI/OpenRouter/Gemini/Custom LLM and complete its settings in the popup."
         );
       }
 
