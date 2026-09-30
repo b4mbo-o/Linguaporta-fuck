@@ -1,201 +1,99 @@
 # LinguaportaFuck
 
-Chrome 拡張で Linguaporta の問題文と選択肢を読み取り、AIによるヒント生成を支援するツールです。  
-従来の Moodle 問題ページにも引き続き対応しています。
-現在は複数API（OpenAI / Gemini / OpenRouter / OpenAI互換Custom LLM）に対応しています。
-Linguaportaの `/user/seibido/` 配下全体を対象にするため、URLで `index.php` が省略される画面でもcontent scriptとステータスウィジェットが動作します。
+Linguaportaの問題を読み取り、AI回答の入力・採点・再回答・次問題への移動を自動化するChrome拡張です。
 
-## 現在の動作（2026-09 時点）
+対象ページは `http(s)://*.linguaporta.jp/user/seibido/*` です。`index.php` が省略されたURLでも動作します。
 
-### 1. モデル選択とフォールバック
+## 主な機能
 
-- デフォルトの優先順は `OpenAI -> Gemini -> OpenRouter`。popupでCustom LLMを含む任意の順番へ変更でき、通常回答と不正解後の再回答の両方でその順番を厳守する。設定不足のプロバイダは自動でスキップされる。
-- OpenAI 公式 API では、データ共有特典へオプトイン済みの対象アカウントで無料トークン対象となる `gpt-5.6-luna` を先に使用し、通信失敗または回答検証失敗時に `gpt-5.6-terra` へフォールバックする。
-- Linguaportaで `#false_msg` が表示された不正解後も、保存済みProvider順を維持する。Gemini、OpenRouter、Custom LLMがOpenAIより上なら先に使用し、OpenAIの番になった場合だけ通常のLuna/Terraではなく `gpt-5.6-sol` を使用する。どのProviderが回答しても再回答欄へ反映し、「もう一度解答する」を1回だけ自動クリックする。
-- OpenRouter では Gemini 系モデルを使用（`google/gemini-2.5-flash-lite` -> `google/gemini-2.5-flash` -> `google/gemini-2.0-flash-001` -> `google/gemini-2.0-flash-lite-001`）。
-- Free API Mode が ON の場合は、OpenRouter の `:free` モデルを先に試してから Gemini 系モデルへフォールバック。
-- Detailed Mode / 資料優先モードのOpenRouterでは `google/gemini-2.5-pro` -> `google/gemini-2.5-flash` -> `google/gemini-2.5-flash-lite` の順で使用。GoogleのGemini APIへ直接接続する場合は現行の `gemini-3.8-flash` を使用する。
-- **画像付き問題** かつ **有料モード**（Free API Mode OFF）でOpenRouterを使う場合、`flash-lite` より先に `gemini-2.5-flash` を優先（vision 精度が高いため）。Gemini APIへ直接接続する場合は画像にも `gemini-3.8-flash` を使用する。Free API Mode ON 時や無料モデルの並びには影響しない。
-- Provider の優先順位は popup の並び順を尊重。Gemini が quota / 残高なし系エラー（429 等）で失敗した場合は、Gemini の残りモデルを飛ばして次の provider（OpenRouter 等）へ即座に切り替わる。
-- 非音声問題は popup の保存順を厳守する。全Providerが失敗した場合は最後のエラーだけでなく、OpenAIを含む各Providerの失敗理由を保存順で表示する。
-- 複数問検出時もAI API呼び出しは最大2本までに抑え、詰まったリクエストは15秒で切る。
-- 実際に使われた `Provider` / `Model` はヒントパネルに表示。
+- 問題文、日本語訳、選択肢、空欄、画像、音声を抽出して回答を生成
+- テキスト入力、ラジオボタン、チェックボックス、セレクト、並び替え問題へ回答を反映
+- 回答反映後に「解答する」を自動クリック
+- 不正解時は採点済みの誤答を除外し、OpenAIの `gpt-5.6-sol` で再回答
+- PlaMo・OpenAIなどProviderを問わず、サイトで正解になった回答をローカル保存
+- AI回答が2回とも不正解なら「正解を見る」を開き、表示された正答もローカル保存
+- 保存済み正答は問題IDが変わっても本文で照合し、次回はAPIを使わず入力・送信
+- 正答保存後や正解後は「次の問題」を自動クリック
+- 拡張機能の再読み込み後も、開いているLinguaportaタブへcontent scriptとステータス表示を復旧
 
-### 2. OpenRouter の制限考慮
+## Provider
 
-- 現在のデフォルトは OpenRouter の有料/通常 Gemini モデルなので、無料枠チェックは通常スキップ。
-- レート制限は OpenRouter 公式 Limits に準拠して扱う。
-- `:free` モデル利用時のみ、無料枠エラー（例: `free-models-per-min`, `free-models-per-day`, `402`）を検知して次の候補へ進む。
+次のProviderを複数有効化し、popupで通常の優先順位を変更できます。
 
-参考: https://openrouter.ai/docs/api/reference/limits
+- OpenAI
+- Gemini
+- OpenRouter
+- Custom LLM（OpenAI互換Chat Completions API）
 
-### 3. 資料優先モード（Material Mode）
+設定不足やquota・残高・通信エラーで失敗したProviderはスキップし、次のProviderへフォールバックします。実際に使用したProvider、モデル、音声処理経路は問題パネルとステータス欄へ表示します。
 
-- PDF / テキスト資料を popup から投入可能。
-- 問題文に関連する断片を抽出し、回答生成時に優先参照。
-- 資料モード有効時は精度寄りのプロンプトに切替。
+### PlaMo
 
-### 4. 画像付き問題への対応
+Custom LLMのモデル名に `PlaMo` が含まれる場合、音声のない単語・語句・意味・翻訳・空欄問題ではpopupの順位に関係なくCustom LLMを最優先にします。不正解後の再回答ではOpenAIを最優先に切り替えます。
 
-- 問題文（`.qtext` / `.formulation`）内の `<img>` を検出し、base64 化して AI に添付。
-- 画像がある問題では vision 非対応モデル（`gpt-oss` / `qwen3-coder` / `deepseek` 系）を自動でスキップし、Gemini など vision 対応モデルへ。
-- 1 問あたり最大 4 枚、6MB まで。32px 未満のアイコン類は除外。
-- 画像の取得結果はキャッシュされ、同じ画像を何度も取得しない（失敗時は次回スキャンで再試行）。
-- 標準モードでは Gemini 2.5 Flash の thinking を無効化して空応答を防止（詳細モード・画像付き問題では thinking を許可）。
+PlaMoは音声モデルとして扱いません。
 
-### 5. 複数空欄（gapselect）への対応
+### 音声問題
 
-- 文中に複数のドロップダウン（`<select>`）が並ぶ問題に対応。
-- 文全体を `[1] [2] [3] …` と番号付きにして **1 回のリクエストでまとめて** 解かせるので、空欄同士の関係（例: `<body>～</body>` 内に `canvas` タグ）を踏まえた解答になる。
-- 各空欄の選択肢はその空欄専用の候補として送信し、返答は選択肢に一致するよう検証。
-- 1 つのヒントパネル内に `空白1: body` / `空白2: body` / `空白3: canvas` … と改行して分かりやすく表示。
+Linguaportaの `audio#sound` を音声問題として扱います。
 
-### 6. 計算問題は式だけAIに出させて、計算はローカルで実行
+- 音声・文字起こし系Customモデルを設定している場合はGeminiの直接音声解析を優先可能
+- OpenAIでは `gpt-transcribe` で文字起こし後、回答モデルへ渡す
+- PlaMoなど通常のテキストモデルを設定している場合は、保存されたProvider順を維持
 
-- 数値回答が必要な問題（指数・単位変換など）では、AI に「答えを計算せず `EXPR: 3.3e-6 * 2 / 1e-3` のように式だけ出す」よう指示。
-- その式を `background.js` 内の自前の安全な数式パーサ（`eval`/`Function` 不使用、四則演算・`^`・括弧・`sqrt`/`log`等の関数のみを許可する再帰下降パーサ）で実際に計算し、その結果を最終回答として採用。
-- 単純な暗記・カウント系の数値（式が不要なもの）は今まで通り AI がそのまま数字を出す。
-- 式の解析に失敗した場合は、従来通りの数字抽出ロジックにフォールバック。
+### Custom LLM
 
-### 7. 再スキャンの安定化
+Ollama、LM Studio、vLLMなどのOpenAI互換APIを利用できます。
 
-- クイズのタイマーや自動保存など、問題内容と無関係な DOM 変化では再スキャンしないように限定。
-- 既に解答済みの問題を無限に解き直す挙動を防止。
+- endpointとmodelは必須
+- ローカルLLMではAPIキーを省略可能
+- endpointが `/v1` で終わる場合は `/v1/chat/completions` へ自動補完
 
-### 8. 複数空欄の番号ズレ対策 / ラベル・型検出の精度向上
+例:
 
-- 複数の空欄をまとめて解かせる際、AI が番号を1つ飛ばす／ズラす（例: `1:` を出さず `2:` から始める）ことがある。この場合、モデル自身の番号だけを信じると全ての答えが1個ずつ隣の空欄にズレて割り当てられてしまう。
-- 番号どおりの割り当てと、出現順どおりの割り当ての両方を試し、フォーマット的に有効な答えが多い方を採用。番号がズレている兆候（連番だが1から始まっていない）がある場合は出現順を優先。
-- 各空欄の「前の文脈」抽出ロジック（`<ul><li>`で複数空欄が並ぶレイアウト）に、対象の空欄より後ろの段落まで巻き込んでしまうバグがあった。文書順を正しく辿るよう修正し、`カタカナ限定`／`記号（半角）`のような型判定が、無関係な別セクションの指示文に引っ張られて誤判定されないようにした。
-- 各空欄に送る名前も、汎用的な `Blank 2`/`Symbol` ではなく、実際のラベル（`I1`、`元素名1`、`人体が受ける放射線量を表す単位の記号` など）を抽出して使うことで、同じ変数名が複数回登場する問題（例: 図1と図2で共通の`I`）でもAIが混同しにくくなる。
+```text
+Endpoint: https://example.invalid/v1
+Model: mitmul/plamo-2-translate:Q4_K_M
+```
 
-### 9. 既に回答済みの欄は自動生成しない
+## 空欄問題と正答学習
 
-- 解答欄（テキスト入力・ラジオ・チェックボックス・セレクト）に既に値が入っている問題は、ページ読み込み時に自動でヒントを生成しない（無駄な API 呼び出し防止、既存の入力を上書きするような見た目を避けるため）。
-- 代わりにパネルは「Skipped」状態で表示され、`Generate hint` ボタンを押した時だけ生成される。
-- 複数空欄をまとめて解くグループでは、いずれか1つでも入力済みならグループ全体をスキップ（1回のリクエストで全部解くため）。
+穴埋め問題では空欄前後の英文、日本語の指示・訳、選択肢をまとめて送信します。英語の数値判定は単語単位で行い、`computer` 内の `compute` や `country` 内の `count` を数値問題と誤認しません。
 
-### 10. UI/UX
+同じ問題へのAI生成は最大2回です。送信前の回答をタブ単位の一時JSONへ保持し、サイトの `正解` 表示を確認できた回答だけを正答JSONへ昇格します。正解時にはその問題のAI回答回数と再送信ガードも消去します。
 
-- ヒントパネルに `Retry` ボタンあり（その問題だけ再実行）。一時停止中は「Paused」を表示。
-- ページ下部のステータス欄に「停止／再開」ボタンを表示する。停止時は待機中の処理を破棄し、通信中の回答が後から返っても入力・送信・次問題への移動を行わない。状態は保存されるため、再開するまで別の問題ページでも停止を維持する。
-- ステータスウィジェット表示/非表示切替あり。
-- API プロバイダは複数選択・優先順位入れ替え可能。
-- プロバイダのフォールバック発生（例: Geminiが失敗してOpenRouterに切り替わった）は、ヒントパネルには表示せず、popup 内の折りたたみ式「Logs」セクション（デフォルトは非表示、クリックで展開）に記録される。最大50件、「Clear Logs」で削除可能。
+1. 通常回答を生成して自動送信
+2. サイトで正解になったら、その回答を正答JSONへ保存
+3. 不正解なら、前回の誤答を禁止してOpenAIで再回答
+4. 再回答が正解なら、その回答も正答JSONへ保存
+5. 再び不正解なら「正解を見る」を自動クリック
+6. `.qu03` のreadonly欄から正答を保存
+7. 「次の問題」を自動クリック
+8. 同じ本文が再出題されたら保存済み正答を適用
 
-### 11. Linguaporta対応
+保存済み正答が後から不正解になった場合は、その記録を削除して通常のAI回答へ戻ります。正答は最大2,000件まで `chrome.storage.local` に保存します。
 
-- `/user/seibido/index.php` の問題ページで自動起動する。
-- `#problem-area` を1問として認識し、`#qu01` / `#qu02` などの連番要素から問題文だけを抽出する。
-- `#drill_form` 内のラジオボタン、チェックボックス、セレクトから選択肢を抽出する。
-- AI回答と一致したラジオボタン／チェックボックス／セレクトを自動選択する。複数回答では該当するチェックボックスをすべて選択する。
-- 初回の回答を入力・選択・並び替えできた場合は、専用の `#ans_submit` が「解答する」であることを確認し、そのボタン要素を1回だけ自動クリックする。不正解後は優先順位の最上位で利用可能なLLMによる最初の再回答だけ「もう一度解答する」を自動クリックし、同じ問題の2回目は停止する。
-- 同一問題に対するAI回答生成は最大2回（初回＋不正解後の再回答）まで。問題文・選択肢・空欄構造から作った安定した指紋と回数を拡張機能ストレージへ30分保持するため、ページ遷移や問題ID変更があっても3回目のAPI送信は行わない。
-- 全Providerが失敗して有効な回答を1つも適用できなかった通信は回答回数に数えず、予約した回数を戻す。
-- 穴埋め問題では、`#drill_form` 内の入力欄を含む英文を `[blank]` 付きで問題文へ追加し、AI回答をテキスト欄へ自動入力する。
-- 記述式入力欄と補助的なradio/selectが同じフォームにあるLinguaportaテンプレートでは記述欄を優先し、自由入力の英単語を「選択肢にない」という理由で誤って無効化しない。
-- `type` 属性を省略した通常の `<input>` も記述式入力欄として扱う。また、選択肢が0件なら画面側の分類がmultiple choiceになっていても自由入力へフォールバックし、`watch` のような有効な穴埋め回答を拒否しない。
-- 数値問題の英語キーワードは単語単位で判定し、`country` 内の `count` や `computer` 内の `compute` を数値問題と誤認しない。
-- 穴埋めは空欄付近の単語だけで推測せず、空欄の前後を含む文・周辺文・日本語の指示や訳・選択肢をまとめて照合する。時制、主語と動詞、単複、冠詞、前置詞、語順、コロケーション、意味の自然さを確認する専用プロンプトと推論枠を使う。
-- 不正解後に表示される `#answer_info` や `解答：×...` は通常の問題文・選択肢には混ぜず、取り消し線の前回答だけを「採点済みの除外回答」として抽出する。再回答時はその語を再使用せず、日本語の意味手掛かりから別の教材想定解を選ぶよう明示し、モデルが同じ語を返した場合もローカルで拒否して次のモデル／Providerへ進む。
-- 正解後の画面は `#true_msg`（「正解」）で全問題形式共通に判定し、AI回答の生成・自動入力を行わない。画面切り替え前のリクエストが遅れて返った場合も、その回答は表示・反映しない。正解時は専用の `.button-next-problem` とフォームの `action=次の問題` を確認してから、問題IDごとに1回だけ「次の問題」を自動クリックする。
-- 並び替え問題では `.CardStyle` の全語句と `.qu03` の空欄文を抽出し、AIが返した `→` 区切りの順序でカードを `.DropLine` 上へ並べる。サイト側の遅延初期化でカードが空の間はAPI送信せず、初期化後に再スキャンする。配置座標はLinguaportaの採点条件と同じ式で設定し、不正解後の並びも同様に修正する。
-- Custom LLMが有効でモデル名に `PlaMo` を含む場合、音声のない単語・語句・意味・翻訳・空欄問題ではpopupの順位に関係なくCustom LLMを最優先にする。サイトで不正解になった再回答ではこの特例を解除し、OpenAIを最優先にして `gpt-5.6-sol` を使う。
-- 音声穴埋め問題ではLinguaporta固有の `audio#sound` だけを音声問題として扱う。音声・文字起こし系Custom LLM（audio / speech / Whisper / ASR / STT / Voxtral / realtime / omni等）の場合だけ、Geminiキーが保存済みならpopupでGeminiが未選択でもGeminiを最優先にし、現行の `gemini-3.8-flash` でMP3等を直接解析する。PlaMoは音声モデルとして扱わない。それ以外では保存済みProvider順を維持する。ページ内で音声取得に失敗した場合はバックグラウンドからLinguaportaの音声URLを再取得する。Geminiのquota・レート制限等で利用できない場合は残りのProvider順へフォールバックし、OpenAIでは `gpt-transcribe` で文字起こししてから通常の回答モデルへ渡す。
-- Custom LLM endpointが `/v1` で終わる場合は、OpenAI互換の `/v1/chat/completions` へ自動補完する。
-- LinguaportaでAI回答が2回とも不正解になった場合は「正解を見る」を自動で開き、`.qu03` のreadonly欄に表示された正答を問題本文ベースでローカル保存してから「次の問題」を自動クリックする。再出題時は問題IDが変わっていても保存済み正答をAPIより先に適用し、AI回答回数を消費せず自動送信する。保存済み正答が後で不正解になった場合は破棄して通常のAIフォールバックへ戻る。
-- ヒントパネルと下部ステータスには実際のProvider・Model・音声経路（`Gemini direct audio` / `OpenAI gpt-transcribe` 等）を表示する。
-- 拡張機能の再読み込み後に開いたままの問題ページでcontent scriptが切断されている場合は、バックグラウンドが再読み込み直後・ブラウザ起動時・対象タブの読込完了時に接続を確認し、不在時だけcontent scriptを再注入してステータスウィジェットを復帰する。設定popupを開いたときや `Show Status Widget` をONにしたときも同じ復旧を行う。
-- OpenAIの音声問題は文字起こしと回答生成の2回のAPI呼び出しになるため、通常のテキスト問題とは別に文字起こし分の利用量が発生し得る。
-- 日本語の指示文と英語の穴埋め文が併記されている場合は、回答言語を英語として扱う。
-- `xlast_problem_num` を問題IDとして利用し、問題が切り替わった際のキャッシュ混同を防ぐ。
-- 画像付き問題では `#question_area` 内の画像を従来どおりAIへ添付する。
-- すでに選択・入力済みの問題は自動生成せず、必要な場合だけ `Generate hint` から実行する。
+## 資料・画像
 
-添付サンプルHTMLでは、問題文 `この単語・語句の意味はどれですか。 purpose` と、選択肢 `家 / レース / 目的 / クーポン` を分離して処理します。解答フォームのhidden値やナビゲーション文言はAIへ送りません。
+- popupからPDFまたはテキスト資料を登録可能
+- Material Modeでは問題に関連する資料断片を回答生成時に優先参照
+- 問題画像は1問あたり最大4枚、各6MBまで送信
+- 小さな装飾画像は除外
 
-### 12. Moodle本体との互換性
+## ステータスと操作
 
-[Moodle公式リポジトリ](https://github.com/moodle/moodle) の `main` ブランチ（確認時: `6216fe4`）にある問題レンダラーとテンプレートを基準に、生成されるDOMへ追従しています。
+- `Show Status Widget` でページ右下の状態表示を切り替え
+- ステータス欄から停止・再開
+- 停止中は遅れて返った回答を入力・送信しない
+- popupのLogsでProviderフォールバック履歴を確認・削除
 
-- 情報表示だけの `description` は問題としてAPIへ送らない。
-- `match` / `randomsamatch` の表形式マッチング問題を、行ごとの複数空欄としてまとめて処理する。
-- `gapselect` に加え、`ddwtos`（文中へのドラッグ＆ドロップ）の空欄とグループ別候補を処理する。
-- `ordering` の並べ替え項目を抽出し、全項目を正しい順番で返す。ドラッグ中だけ作られる複製DOMは問題として数えない。
-- `multichoice` のcheckboxを複数回答として判定し、正解候補をすべて返す。radioの単一回答とは別の出力検証を行う。
-- `numerical` / `calculated` の単位radio/selectを通常の選択肢と誤認しない。数値回答は数値モードで処理する。
-- Moodleの未選択selectで使われる値 `0` は「回答済み」と判定せず、プレースホルダーも選択肢から除外する。
+## セットアップ
 
-確認に使った主な公式実装: [question engine renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/engine/renderer.php)、[multichoice renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/type/multichoice/renderer.php)、[matching renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/type/match/renderer.php)、[numerical renderer](https://github.com/moodle/moodle/blob/6216fe4ed19a5a3c88c0951d1647e9f2d626bcbb/public/question/type/numerical/renderer.php)。
-
-Moodleの追加プラグイン問題タイプやサイト独自テーマはDOMが異なる場合があります。画像上へ直接配置する `ddimageortext` / `ddmarker` は、現時点では画像をAIへ添付できますが、配置座標を専用形式で解析する機能は未対応です。
-
-## 対応プロバイダ
-
-- OpenRouter（APIキー必要）
-- Gemini（APIキー必要）
-- OpenAI（APIキー必要）
-- Custom LLM（OpenAI互換の `/v1/chat/completions` エンドポイント。endpointとmodelは必須、APIキーはローカルLLMでは省略可能）
-
-Custom LLMではOllama、LM Studio、vLLMなど、OpenAI互換Chat Completions APIを提供するサーバーを登録できます。popupでCustom LLMをONにし、完全なendpoint URL（例: `http://localhost:11434/v1/chat/completions`）とmodel名を入力して保存してください。保存時にそのホストだけの接続権限を確認します。
-
-## 無料枠を活用する運用
-
-料金・対象モデル・レート制限は変更されることがあるため、以下は **2026年8月時点** の情報です。利用前に各リンク先とダッシュボードの表示も確認してください。
-
-| 運用 | 初期支払い | 向いている用途 | 主な制限・注意 |
-| --- | ---: | --- | --- |
-| OpenRouter完全無料 | $0 | 少量利用、試用 | 無課金アカウントは無料モデル合計50リクエスト/日が目安。混雑やモデル停止で失敗することがある |
-| OpenAIデータ共有特典 | 最小$5 | 速度・品質・安定性を重視 | 対象組織のみ。Tier 1–2ではLuna/Terraなどのグループ合計250万token/日。超過分は通常課金 |
-| OpenRouter → OpenAI | $5 | 無料モデルを先に使い、失敗時だけOpenAIへ移る | OpenAI側の無料トークン超過時は購入残高から課金される |
-
-### 完全無料で使う: OpenRouter
-
-1. [OpenRouter](https://openrouter.ai/) でアカウントとAPIキーを作成する。クレジット購入は不要。
-2. popupのプロバイダは **OpenRouterだけ** をONにする。
-3. `Free API Mode` をONにしてAPI設定を保存する。
-4. OpenRouterに有料クレジットを入れず、自動チャージも設定しない。これで有料候補へ到達しても残高不足で停止するため、実費は発生しない。
-
-OpenRouterの `:free` モデルはprompt/completionとも$0ですが、無課金または購入額$10未満のアカウントは無料モデル全体で通常50リクエスト/日です。$10以上のクレジットを購入したアカウントは通常1,000リクエスト/日に増えますが、購入クレジットは有料モデルにも使えるため「完全無料」の安全性は下がります。無料モデルは低レートで、提供モデルや空き状況も変動します。
-
-- [OpenRouter FAQ（無料モデルとレート制限）](https://openrouter.ai/docs/faq)
-- [OpenRouter Free Models Router](https://openrouter.ai/openrouter/free/)
-
-### 最小$5でOpenAIの無料トークン特典を使う
-
-OpenAIには、APIの入出力をモデル改善目的で共有する対象組織向けに、日次のcomplimentary tokens（無料トークン）が付く制度があります。この拡張が使う `gpt-5.6-luna` と `gpt-5.6-terra` は同じ対象グループです。
-
-1. [OpenAI API Platform](https://platform.openai.com/) でAPI組織とプロジェクトを作成する。
-2. Billingでプリペイドクレジットを購入する。公式の最低購入額は **$5**。
-3. 意図しない追加購入を防ぐ場合は、初期設定時に `Auto Recharge` をOFFにする。
-4. Organization OwnerでData controlsを開き、`Share inputs and outputs with OpenAI` に無料利用対象の表示があることを確認する。
-5. 全プロジェクトまたは拡張用プロジェクトだけデータ共有を有効にする。
-6. そのプロジェクトでAPIキーを作成し、popupのOpenAI欄へ保存する。
-7. Usage Dashboardでservice tierを確認し、`data sharing incentive tier` として記録されていることを確認する。
-
-Tier 1–2の対象アカウントでは、Luna/Terraを含むグループで **合計250万token/日** が無料対象です。枠は毎日00:00 UTC（日本時間09:00）にリセットされます。残り枠を1回のリクエストが超える場合、そのリクエスト全体が通常課金になります。対象外の組織、共有していないプロジェクト、ツール利用、上限超過分も通常課金です。また、制度の利用には正のアカウント残高が必要です。
-
-通常課金になった場合の現行テキスト料金は次のとおりです（100万tokenあたり）。
-
-| モデル | 入力 | キャッシュ入力 | 出力 | 拡張内の役割 |
-| --- | ---: | ---: | ---: | --- |
-| `gpt-5.6-luna` | $0.20 | $0.02 | $1.20 | 高速な第一候補 |
-| `gpt-5.6-terra` | $2.00 | $0.20 | $12.00 | Luna失敗時の上位フォールバック |
-
-- [OpenAIのデータ共有とcomplimentary tokens](https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai)
-- [OpenAIのプリペイド課金](https://help.openai.com/en/articles/8264778)
-- [OpenAIの現行モデル一覧](https://developers.openai.com/api/docs/models)
-
-> [!IMPORTANT]
-> 「$5を一度払えば永久に無料」ではありません。購入クレジットは1年で失効し返金不可です。無料トークン制度も30日前の通知で終了する可能性があり、対象条件やモデルは変更されます。正確には「最小$5の残高を用意し、対象期間・日次上限内で長期間ほぼ無料を狙う運用」です。
-
-### 無料枠をできるだけ先に使う推奨順
-
-- 絶対に課金したくない: `OpenRouter` のみ、`Free API Mode` ON、OpenRouter残高$0。
-- 無料優先で成功率も上げたい: `OpenRouter -> OpenAI`、`Free API Mode` ON。OpenAIの日次枠超過時は課金され得る。
-- 速度と回答品質を優先: `OpenAI -> OpenRouter`。OpenAIはLunaから始まり、失敗時にTerraへ移る。
-
-データ共有を有効にすると、この拡張から送信される問題文、選択肢、添付画像、投入した資料の関連部分が共有対象になり得ます。個人情報、機密情報、第三者の非公開資料は送信しないでください。
+1. `chrome://extensions/` を開く
+2. デベロッパーモードをONにする
+3. 「パッケージ化されていない拡張機能を読み込む」でこのフォルダを選ぶ
+4. popupでProvider、APIキー、Custom LLM設定を保存する
+5. Linguaportaの問題ページを再読み込みする
 
 ## ファイル構成
 
@@ -206,18 +104,11 @@ Linguaporta-fuck/
 ├─ content.js
 ├─ popup.html
 ├─ popup.js
-├─ icon.png
-└─ data/
+└─ icon.png
 ```
-
-## セットアップ
-
-1. `chrome://extensions/` を開く
-2. デベロッパーモードを ON
-3. 「パッケージ化されていない拡張機能を読み込む」でこのフォルダを選択
-4. 拡張 popup を開き、使うプロバイダと API キーを設定
 
 ## 注意
 
-- 本ツールは学習補助用途を想定しています。利用規約や授業ルールに従って利用してください。
-- 外部APIへの送信が発生するため、機微情報の取り扱いには注意してください。
+- 学習サイトの利用規約や授業ルールに従って使用してください。
+- 問題文、画像、音声、資料は設定した外部APIへ送信される場合があります。
+- APIの料金、無料枠、モデル提供状況は各Providerの最新情報を確認してください。

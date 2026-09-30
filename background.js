@@ -113,7 +113,7 @@ const MATERIAL_DEFAULTS = {
 };
 
 const SYSTEM_PROMPT =
-  "You solve online learning quiz questions. " +
+  "You solve Linguaporta learning exercises. " +
   "Never greet, chat casually, mention being an assistant, or ask follow-up questions. " +
   "Use the language required by the answer field; when an English sentence contains [blank], answer in English even if its instructions are Japanese. " +
   "Otherwise, when the question is in Japanese, answer in Japanese. " +
@@ -1214,7 +1214,7 @@ function detectAnswerMode(question, options, targetType = "standard") {
   return "short";
 }
 
-function buildQuizPrompt(
+function buildLinguaportaPrompt(
   question,
   options,
   targetType = "standard",
@@ -1235,7 +1235,7 @@ function buildQuizPrompt(
   );
 
   const instructions = [
-    "Solve this quiz question.",
+    "Solve this Linguaporta exercise.",
     "Do not greet.",
     "Do not explain your role.",
     "Return only one line.",
@@ -1476,7 +1476,7 @@ function buildRequestPlans(
     ...primaryPromptModes.map((compactMode) => ({
       providerId: primaryPlan.providerId,
       model: primaryPlan.model,
-      prompt: buildQuizPrompt(
+      prompt: buildLinguaportaPrompt(
         question,
         options,
         targetType,
@@ -1492,7 +1492,7 @@ function buildRequestPlans(
     ...fallbackPlans.map((plan) => ({
       providerId: plan.providerId,
       model: plan.model,
-      prompt: buildQuizPrompt(
+      prompt: buildLinguaportaPrompt(
         question,
         options,
         targetType,
@@ -2438,7 +2438,7 @@ async function requestChatCompletion(
       ];
       // Gemini 3 uses thinkingLevel and rejects the old thinkingBudget form;
       // it also no longer accepts the sampling knobs used by older models.
-      // Keep quiz calls on low unless detailed/image work explicitly asks for
+      // Keep Linguaporta calls on low unless detailed/image work explicitly asks for
       // more reasoning. Legacy Gemini models retain their old configuration.
       const disableLegacyThinking =
         !isGemini3 && !allowThinking && /flash/i.test(model);
@@ -3737,28 +3737,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   return true;
 });
 
-const QUIZ_TAB_URL_PATTERNS = [
-  "http://*/user/seibido/*",
-  "https://*/user/seibido/*",
-  "http://*/mod/quiz/attempt.php*",
-  "https://*/mod/quiz/attempt.php*",
+const LINGUAPORTA_TAB_URL_PATTERNS = [
+  "http://*.linguaporta.jp/user/seibido/*",
+  "https://*.linguaporta.jp/user/seibido/*",
 ];
 const contentRestoreInFlight = new Set();
 
-function isSupportedQuizTabUrl(value) {
+function isSupportedLinguaportaTabUrl(value) {
   try {
     const url = new URL(String(value || ""));
+    const hostname = url.hostname.toLowerCase();
     return (
       /^https?:$/.test(url.protocol) &&
-      (url.pathname.startsWith("/user/seibido/") ||
-        url.pathname.endsWith("/mod/quiz/attempt.php"))
+      (hostname === "linguaporta.jp" || hostname.endsWith(".linguaporta.jp")) &&
+      url.pathname.startsWith("/user/seibido/")
     );
   } catch (_error) {
     return false;
   }
 }
 
-function pingQuizContentScript(tabId) {
+function pingLinguaportaContentScript(tabId) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(
       tabId,
@@ -3771,7 +3770,7 @@ function pingQuizContentScript(tabId) {
   });
 }
 
-function injectQuizContentScript(tabId) {
+function injectLinguaportaContentScript(tabId) {
   return new Promise((resolve, reject) => {
     chrome.scripting.executeScript(
       {
@@ -3790,15 +3789,15 @@ function injectQuizContentScript(tabId) {
   });
 }
 
-async function restoreQuizContentScript(tabId) {
+async function restoreLinguaportaContentScript(tabId) {
   if (!Number.isInteger(tabId) || contentRestoreInFlight.has(tabId)) {
     return;
   }
 
   contentRestoreInFlight.add(tabId);
   try {
-    if (!(await pingQuizContentScript(tabId))) {
-      await injectQuizContentScript(tabId);
+    if (!(await pingLinguaportaContentScript(tabId))) {
+      await injectLinguaportaContentScript(tabId);
     }
   } catch (error) {
     console.warn(`Failed to restore content script in tab ${tabId}:`, error);
@@ -3807,29 +3806,29 @@ async function restoreQuizContentScript(tabId) {
   }
 }
 
-function restoreOpenQuizTabs() {
-  chrome.tabs.query({ url: QUIZ_TAB_URL_PATTERNS }, (tabs) => {
+function restoreOpenLinguaportaTabs() {
+  chrome.tabs.query({ url: LINGUAPORTA_TAB_URL_PATTERNS }, (tabs) => {
     const runtimeError = chrome.runtime.lastError;
     if (runtimeError) {
-      console.warn("Failed to find open quiz tabs:", runtimeError.message);
+      console.warn("Failed to find open Linguaporta tabs:", runtimeError.message);
       return;
     }
 
     for (const tab of tabs || []) {
-      restoreQuizContentScript(tab.id);
+      restoreLinguaportaContentScript(tab.id);
     }
   });
 }
 
-chrome.runtime.onInstalled.addListener(restoreOpenQuizTabs);
-chrome.runtime.onStartup.addListener(restoreOpenQuizTabs);
+chrome.runtime.onInstalled.addListener(restoreOpenLinguaportaTabs);
+chrome.runtime.onStartup.addListener(restoreOpenLinguaportaTabs);
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && isSupportedQuizTabUrl(tab?.url)) {
-    restoreQuizContentScript(tabId);
+  if (changeInfo.status === "complete" && isSupportedLinguaportaTabUrl(tab?.url)) {
+    restoreLinguaportaContentScript(tabId);
   }
 });
 
-// Unpacked-extension reloads start a fresh service worker while existing quiz
+// Unpacked-extension reloads start a fresh service worker while existing Linguaporta
 // tabs stay open. Repair those tabs immediately instead of waiting for a page
 // reload or for the settings popup to be opened.
-restoreOpenQuizTabs();
+restoreOpenLinguaportaTabs();

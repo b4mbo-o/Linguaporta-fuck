@@ -177,13 +177,14 @@ function saveSettings(partialSettings) {
   });
 }
 
-function isSupportedQuizTabUrl(value) {
+function isSupportedLinguaportaTabUrl(value) {
   try {
     const url = new URL(String(value || ""));
+    const hostname = url.hostname.toLowerCase();
     return (
       /^https?:$/.test(url.protocol) &&
-      (url.pathname.startsWith("/user/seibido/") ||
-        url.pathname.endsWith("/mod/quiz/attempt.php"))
+      (hostname === "linguaporta.jp" || hostname.endsWith(".linguaporta.jp")) &&
+      url.pathname.startsWith("/user/seibido/")
     );
   } catch (_error) {
     return false;
@@ -232,7 +233,7 @@ function injectContentScript(tabId) {
 
 async function ensureContentScriptOnActiveTab() {
   const tab = await getActiveTab();
-  if (!tab?.id || !isSupportedQuizTabUrl(tab.url)) {
+  if (!tab?.id || !isSupportedLinguaportaTabUrl(tab.url)) {
     return false;
   }
 
@@ -1037,6 +1038,6 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 ensureContentScriptOnActiveTab()
   .catch((error) => {
-    console.warn("Failed to connect to the active quiz tab:", error);
+    console.warn("Failed to connect to the active Linguaporta tab:", error);
   })
   .finally(refresh);

@@ -1,6 +1,6 @@
-﻿const HINT_STYLE_ID = "moodle-hint-style";
-const HINT_PANEL_CLASS = "moodle-hint-panel";
-const STATUS_WIDGET_ID = "moodle-hint-status-widget";
+const HINT_STYLE_ID = "linguaporta-hint-style";
+const HINT_PANEL_CLASS = "linguaporta-hint-panel";
+const STATUS_WIDGET_ID = "linguaporta-hint-status-widget";
 const PRIMARY_QUESTION_SELECTOR = ".que";
 const FALLBACK_QUESTION_SELECTOR = "[id^='question-']";
 const SUBQUESTION_SELECTOR = ".subquestion";
@@ -18,14 +18,16 @@ const MAX_AUDIO_FILES_PER_QUESTION = 1;
 const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
 const RETRY_SUBMIT_GUARD_STORAGE_KEY = "linguaportaSolRetryGuards";
 const RETRY_SUBMIT_GUARD_TTL_MS = 30 * 60 * 1000;
-// V3 starts a fresh two-answer window after the blank-answer strategy gained
-// rejected-answer feedback; older failed attempts must not block verification.
-const AI_ANSWER_ATTEMPTS_STORAGE_KEY = "linguaportaAiAnswerAttemptsV3";
+// V4 starts a fresh two-answer window now that every site-confirmed answer is
+// learned; stale V3 counts must not block a later round of the same problem.
+const AI_ANSWER_ATTEMPTS_STORAGE_KEY = "linguaportaAiAnswerAttemptsV4";
 const AI_ANSWER_ATTEMPT_TTL_MS = 30 * 60 * 1000;
 const MAX_AI_ANSWERS_PER_QUESTION = 2;
 const AI_ANSWER_LIMIT_ERROR_CODE = "AI_ANSWER_LIMIT_REACHED";
 const LEARNED_ANSWERS_STORAGE_KEY = "linguaportaLearnedAnswersV1";
 const MAX_LEARNED_ANSWERS = 2000;
+const PENDING_CORRECT_ANSWER_SESSION_KEY = "linguaportaPendingCorrectAnswerV1";
+const PENDING_CORRECT_ANSWER_TTL_MS = 30 * 60 * 1000;
 
 const answerCache = new Map();
 const imageDataUrlCache = new Map();
@@ -173,7 +175,7 @@ function renderNodeText(node, options = {}) {
 
   if (
     element.matches(".accesshide, .sr-only, script, style, label.subq") ||
-    element.matches(".moodle-hint-anchor") ||
+    element.matches(".linguaporta-hint-anchor") ||
     element.matches(`#${STATUS_WIDGET_ID}`)
   ) {
     return "";
@@ -199,7 +201,7 @@ function renderNodeText(node, options = {}) {
     return blankToken;
   }
 
-  // Moodle's drag-and-drop-words question type renders blanks as spans
+  // Drag-and-drop word questions render blanks as spans
   // instead of form controls. Treat them exactly like the select-based
   // missing-word blanks so the model sees their positions.
   if (element.matches(".drop[class*='group']")) {
@@ -246,7 +248,31 @@ function renderChildrenText(element, options = {}) {
     .join("");
 }
 
+let obsoleteUiCleaned = false;
+
+function cleanupObsoleteExtensionUi() {
+  if (obsoleteUiCleaned) {
+    return;
+  }
+  obsoleteUiCleaned = true;
+
+  for (const element of Array.from(
+    document.querySelectorAll(
+      "style[id$='-hint-style'], div[id$='-hint-status-widget'], div[class$='-hint-anchor']"
+    )
+  )) {
+    const isCurrentUi =
+      element.id === HINT_STYLE_ID ||
+      element.id === STATUS_WIDGET_ID ||
+      element.classList?.contains("linguaporta-hint-anchor");
+    if (!isCurrentUi) {
+      element.remove();
+    }
+  }
+}
+
 function ensureStyles() {
+  cleanupObsoleteExtensionUi();
   if (document.getElementById(HINT_STYLE_ID)) {
     return;
   }
@@ -254,7 +280,7 @@ function ensureStyles() {
   const style = document.createElement("style");
   style.id = HINT_STYLE_ID;
   style.textContent = `
-    .moodle-hint-anchor {
+    .linguaporta-hint-anchor {
       display: flex;
       justify-content: flex-end;
       margin-top: 12px;
@@ -287,12 +313,12 @@ function ensureStyles() {
       border-color: rgba(15, 23, 42, 0.1);
     }
 
-    .${HINT_PANEL_CLASS}[data-state="manual"] .moodle-hint-answer {
+    .${HINT_PANEL_CLASS}[data-state="manual"] .linguaporta-hint-answer {
       color: #64748b;
       font-weight: 600;
     }
 
-    .moodle-hint-header {
+    .linguaporta-hint-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -300,7 +326,7 @@ function ensureStyles() {
       margin-bottom: 8px;
     }
 
-    .moodle-hint-title {
+    .linguaporta-hint-title {
       font-size: 13px;
       font-weight: 700;
       letter-spacing: 0.02em;
@@ -308,13 +334,13 @@ function ensureStyles() {
       color: #9a3412;
     }
 
-    .moodle-hint-status {
+    .linguaporta-hint-status {
       font-size: 12px;
       color: #64748b;
       white-space: nowrap;
     }
 
-    .moodle-hint-answer {
+    .linguaporta-hint-answer {
       font-size: 16px;
       font-weight: 700;
       color: #0f172a;
@@ -322,7 +348,7 @@ function ensureStyles() {
       word-break: break-word;
     }
 
-    .moodle-hint-reason {
+    .linguaporta-hint-reason {
       margin-top: 8px;
       font-size: 13px;
       color: #475569;
@@ -330,24 +356,24 @@ function ensureStyles() {
       word-break: break-word;
     }
 
-    .moodle-hint-meta {
+    .linguaporta-hint-meta {
       margin-top: 10px;
       font-size: 12px;
       color: #64748b;
     }
 
-    .moodle-hint-actions {
+    .linguaporta-hint-actions {
       margin-top: 10px;
       display: none;
       justify-content: flex-end;
     }
 
-    .${HINT_PANEL_CLASS}[data-state="error"] .moodle-hint-actions,
-    .${HINT_PANEL_CLASS}[data-state="manual"] .moodle-hint-actions {
+    .${HINT_PANEL_CLASS}[data-state="error"] .linguaporta-hint-actions,
+    .${HINT_PANEL_CLASS}[data-state="manual"] .linguaporta-hint-actions {
       display: flex;
     }
 
-    .moodle-hint-retry {
+    .linguaporta-hint-retry {
       appearance: none;
       border: 1px solid rgba(15, 23, 42, 0.18);
       border-radius: 8px;
@@ -360,12 +386,12 @@ function ensureStyles() {
       cursor: pointer;
     }
 
-    .moodle-hint-retry:hover {
+    .linguaporta-hint-retry:hover {
       border-color: rgba(15, 23, 42, 0.34);
     }
 
-    .moodle-hint-reason:empty,
-    .moodle-hint-meta:empty {
+    .linguaporta-hint-reason:empty,
+    .linguaporta-hint-meta:empty {
       display: none;
     }
 
@@ -402,7 +428,7 @@ function ensureStyles() {
       background: rgba(159, 18, 57, 0.95);
     }
 
-    .moodle-status-title {
+    .linguaporta-status-title {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -413,13 +439,13 @@ function ensureStyles() {
       text-transform: uppercase;
     }
 
-    .moodle-status-controls {
+    .linguaporta-status-controls {
       display: inline-flex;
       align-items: center;
       gap: 10px;
     }
 
-    .moodle-status-toggle {
+    .linguaporta-status-toggle {
       appearance: none;
       border: 1px solid rgba(255, 255, 255, 0.55);
       border-radius: 8px;
@@ -434,19 +460,19 @@ function ensureStyles() {
       text-transform: none;
     }
 
-    .moodle-status-toggle:hover {
+    .linguaporta-status-toggle:hover {
       background: rgba(153, 27, 27, 0.98);
     }
 
-    .moodle-status-toggle[data-paused="true"] {
+    .linguaporta-status-toggle[data-paused="true"] {
       background: rgba(4, 120, 87, 0.95);
     }
 
-    .moodle-status-toggle[data-paused="true"]:hover {
+    .linguaporta-status-toggle[data-paused="true"]:hover {
       background: rgba(5, 150, 105, 0.98);
     }
 
-    .moodle-status-pill {
+    .linguaporta-status-pill {
       display: inline-flex;
       align-items: center;
       gap: 8px;
@@ -455,7 +481,7 @@ function ensureStyles() {
       color: rgba(248, 250, 252, 0.92);
     }
 
-    .moodle-status-pill::before {
+    .linguaporta-status-pill::before {
       content: "";
       width: 9px;
       height: 9px;
@@ -465,30 +491,30 @@ function ensureStyles() {
       flex: none;
     }
 
-    #${STATUS_WIDGET_ID}[data-phase="running"] .moodle-status-pill::before {
+    #${STATUS_WIDGET_ID}[data-phase="running"] .linguaporta-status-pill::before {
       background: #38bdf8;
     }
 
-    #${STATUS_WIDGET_ID}[data-phase="ready"] .moodle-status-pill::before {
+    #${STATUS_WIDGET_ID}[data-phase="ready"] .linguaporta-status-pill::before {
       background: #34d399;
     }
 
-    #${STATUS_WIDGET_ID}[data-phase="idle"] .moodle-status-pill::before {
+    #${STATUS_WIDGET_ID}[data-phase="idle"] .linguaporta-status-pill::before {
       background: #94a3b8;
     }
 
-    #${STATUS_WIDGET_ID}[data-phase="error"] .moodle-status-pill::before {
+    #${STATUS_WIDGET_ID}[data-phase="error"] .linguaporta-status-pill::before {
       background: #fb7185;
     }
 
-    .moodle-status-message {
+    .linguaporta-status-message {
       margin-top: 10px;
       font-size: 14px;
       line-height: 1.5;
       color: #f8fafc;
     }
 
-    .moodle-status-meta {
+    .linguaporta-status-meta {
       margin-top: 10px;
       font-size: 12px;
       line-height: 1.5;
@@ -497,7 +523,7 @@ function ensureStyles() {
     }
 
     @media (max-width: 900px) {
-      .moodle-hint-anchor {
+      .linguaporta-hint-anchor {
         justify-content: stretch;
       }
 
@@ -540,7 +566,7 @@ function ensureStatusWidget() {
     // script context (and event listeners) no longer works. Reattach the
     // current listener when the popup restores the script.
     widget
-      .querySelector(".moodle-status-toggle")
+      .querySelector(".linguaporta-status-toggle")
       ?.addEventListener("click", toggleRuntimeFromStatusWidget);
     syncStatusWidgetVisibility();
     return widget;
@@ -550,19 +576,19 @@ function ensureStatusWidget() {
   widget.id = STATUS_WIDGET_ID;
   widget.dataset.phase = "booting";
   widget.innerHTML = `
-    <div class="moodle-status-title">
+    <div class="linguaporta-status-title">
       <span>LinguaportaFuck</span>
-      <span class="moodle-status-controls">
-        <span class="moodle-status-pill">Booting</span>
-        <button class="moodle-status-toggle" type="button">停止</button>
+      <span class="linguaporta-status-controls">
+        <span class="linguaporta-status-pill">Booting</span>
+        <button class="linguaporta-status-toggle" type="button">停止</button>
       </span>
     </div>
-    <div class="moodle-status-message">Content script started.</div>
-    <div class="moodle-status-meta">Waiting for page scan...</div>
+    <div class="linguaporta-status-message">Content script started.</div>
+    <div class="linguaporta-status-meta">Waiting for page scan...</div>
   `;
 
   widget
-    .querySelector(".moodle-status-toggle")
+    .querySelector(".linguaporta-status-toggle")
     .addEventListener("click", toggleRuntimeFromStatusWidget);
 
   (document.body || document.documentElement).appendChild(widget);
@@ -571,7 +597,7 @@ function ensureStatusWidget() {
 }
 
 function updateStatusToggle(widget) {
-  const button = widget?.querySelector(".moodle-status-toggle");
+  const button = widget?.querySelector(".linguaporta-status-toggle");
   if (!button) {
     return;
   }
@@ -649,10 +675,10 @@ function setStatus(phase, message, extra = {}) {
     runtimeState.lastAudioMode ? `Audio: ${runtimeState.lastAudioMode}` : "",
   ].filter(Boolean).join(" | ");
 
-  widget.querySelector(".moodle-status-pill").textContent =
+  widget.querySelector(".linguaporta-status-pill").textContent =
     labelMap[phase] || phase;
-  widget.querySelector(".moodle-status-message").textContent = message;
-  widget.querySelector(".moodle-status-meta").textContent = meta;
+  widget.querySelector(".linguaporta-status-message").textContent = message;
+  widget.querySelector(".linguaporta-status-meta").textContent = meta;
   updateStatusToggle(widget);
 }
 
@@ -1042,6 +1068,18 @@ function extractLinguaportaQuestionText(questionRoot) {
   );
 }
 
+function getLinguaportaPromptIdentity(questionRoot) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return "";
+  }
+
+  return Array.from(questionRoot.querySelectorAll("#question_area [id]"))
+    .filter((element) => /^qu\d+$/i.test(element.id))
+    .map((element) => normalizeText(renderNodeText(element)))
+    .filter(Boolean)
+    .join("\n");
+}
+
 function isLinguaportaCorrectResult(questionRoot) {
   if (!isLinguaportaQuestionRoot(questionRoot)) {
     return false;
@@ -1345,6 +1383,159 @@ async function saveLearnedCorrectAnswer(revealedAnswer) {
   );
   await setStoredObject(LEARNED_ANSWERS_STORAGE_KEY, trimmedAnswers);
   return { answer, fingerprint, saved: true };
+}
+
+function createLearnableQuestionSnapshot(question) {
+  return {
+    questionText: normalizeText(question?.questionText || ""),
+    markedText: normalizeText(question?.markedText || ""),
+    groupMarkedText: normalizeText(question?.groupMarkedText || ""),
+    options: Array.isArray(question?.options)
+      ? question.options.map((option) => normalizeText(option)).filter(Boolean)
+      : [],
+    blanks: Array.isArray(question?.blanks)
+      ? question.blanks.map((blank) => ({
+          label: normalizeText(blank?.label || ""),
+          options: Array.isArray(blank?.options)
+            ? blank.options.map((option) => normalizeText(option)).filter(Boolean)
+            : [],
+        }))
+      : [],
+    groupBlanks: Array.isArray(question?.groupBlanks)
+      ? question.groupBlanks.map((blank) => ({
+          label: normalizeText(blank?.label || ""),
+          fieldType: normalizeText(blank?.fieldType || ""),
+        }))
+      : [],
+    targetType: normalizeText(question?.targetType || "standard"),
+  };
+}
+
+function rememberPendingCorrectAnswer(question, answerText) {
+  if (!isLinguaportaQuestionRoot(question?.questionRoot)) {
+    return false;
+  }
+
+  const answer = normalizeText(answerText);
+  const questionSnapshot = createLearnableQuestionSnapshot(question);
+  if (!answer || !questionSnapshot.questionText) {
+    return false;
+  }
+
+  try {
+    window.sessionStorage.setItem(
+      PENDING_CORRECT_ANSWER_SESSION_KEY,
+      JSON.stringify({
+        answer,
+        question: questionSnapshot,
+        fingerprint: getAiAnswerFingerprint(questionSnapshot),
+        promptIdentity: getLinguaportaPromptIdentity(question.questionRoot),
+        questionId: getLinguaportaQuestionId(question.questionRoot),
+        updatedAt: Date.now(),
+      })
+    );
+    return true;
+  } catch (error) {
+    console.warn("Failed to stage a Linguaporta answer for learning:", error);
+    return false;
+  }
+}
+
+function readPendingCorrectAnswer() {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_CORRECT_ANSWER_SESSION_KEY);
+    if (!raw) {
+      return null;
+    }
+    const record = JSON.parse(raw);
+    if (
+      !record ||
+      typeof record !== "object" ||
+      !normalizeText(record.answer) ||
+      !record.question?.questionText ||
+      Date.now() - Number(record.updatedAt || 0) > PENDING_CORRECT_ANSWER_TTL_MS
+    ) {
+      window.sessionStorage.removeItem(PENDING_CORRECT_ANSWER_SESSION_KEY);
+      return null;
+    }
+    return record;
+  } catch (error) {
+    console.warn("Failed to read the staged Linguaporta answer:", error);
+    return null;
+  }
+}
+
+function clearPendingCorrectAnswer() {
+  try {
+    window.sessionStorage.removeItem(PENDING_CORRECT_ANSWER_SESSION_KEY);
+  } catch (_error) {
+    // Session storage may be unavailable under restrictive browser settings.
+  }
+}
+
+async function clearConfirmedAnswerAttemptState(fingerprint) {
+  if (!fingerprint) {
+    return;
+  }
+
+  const [attempts, retryGuards] = await Promise.all([
+    getStoredObject(AI_ANSWER_ATTEMPTS_STORAGE_KEY),
+    getStoredObject(RETRY_SUBMIT_GUARD_STORAGE_KEY),
+  ]);
+  let attemptsChanged = false;
+  let guardsChanged = false;
+  if (fingerprint in attempts) {
+    delete attempts[fingerprint];
+    attemptsChanged = true;
+  }
+  if (fingerprint in retryGuards) {
+    delete retryGuards[fingerprint];
+    guardsChanged = true;
+  }
+
+  await Promise.all([
+    attemptsChanged
+      ? setStoredObject(AI_ANSWER_ATTEMPTS_STORAGE_KEY, attempts)
+      : Promise.resolve(),
+    guardsChanged
+      ? setStoredObject(RETRY_SUBMIT_GUARD_STORAGE_KEY, retryGuards)
+      : Promise.resolve(),
+  ]);
+  aiAttemptReservationChains.delete(fingerprint);
+  retrySubmitReservations.delete(fingerprint);
+}
+
+async function promoteConfirmedCorrectAnswer(questionRoot) {
+  if (!isLinguaportaCorrectResult(questionRoot)) {
+    return null;
+  }
+
+  const pending = readPendingCorrectAnswer();
+  if (!pending) {
+    return null;
+  }
+
+  const currentPromptIdentity = getLinguaportaPromptIdentity(questionRoot);
+  const currentQuestionId = getLinguaportaQuestionId(questionRoot);
+  const promptMatches =
+    Boolean(pending.promptIdentity) &&
+    pending.promptIdentity === currentPromptIdentity;
+  const idMatches =
+    Boolean(pending.questionId) && pending.questionId === currentQuestionId;
+  if (!promptMatches && !idMatches) {
+    clearPendingCorrectAnswer();
+    return null;
+  }
+
+  const learned = await saveLearnedCorrectAnswer({
+    answer: pending.answer,
+    question: pending.question,
+  });
+  await clearConfirmedAnswerAttemptState(
+    normalizeText(pending.fingerprint) || getAiAnswerFingerprint(pending.question)
+  );
+  clearPendingCorrectAnswer();
+  return learned;
 }
 
 async function deleteLearnedCorrectAnswer(question) {
@@ -1712,7 +1903,7 @@ function isFormControlFilled(element) {
 
   if (element.tagName === "SELECT") {
     const value = normalizeText(element.value);
-    // Moodle matching questions use value="0" for the unselected
+    // Some matching templates use value="0" for the unselected
     // "Choose..." entry. Treating it as filled suppresses every hint.
     return Boolean(value && value !== "0");
   }
@@ -1744,7 +1935,7 @@ function answerRootHasExistingAnswer(questionRoot) {
     return false;
   }
 
-  // Moodle checkbox groups pair each visible checkbox with a hidden input
+  // Some checkbox groups pair each visible checkbox with a hidden input
   // carrying the "unchecked" fallback value (e.g. value="0"). That hidden
   // input always has a non-empty value, so it must be excluded here or
   // every checkbox question would look "already answered".
@@ -1917,7 +2108,7 @@ function collectTextBeforeNode(root, targetNode, collector) {
     }
 
     if (
-      child.matches?.(".moodle-hint-anchor") ||
+      child.matches?.(".linguaporta-hint-anchor") ||
       child.matches?.(`#${STATUS_WIDGET_ID}`)
     ) {
       continue;
@@ -2239,7 +2430,7 @@ function collectQuestionImageElements(container) {
   return Array.from(container.querySelectorAll("img")).filter((img) => {
     if (
       img.closest(`.${HINT_PANEL_CLASS}`) ||
-      img.closest(".moodle-hint-anchor") ||
+      img.closest(".linguaporta-hint-anchor") ||
       img.closest(`#${STATUS_WIDGET_ID}`)
     ) {
       return false;
@@ -2447,7 +2638,7 @@ async function attachQuestionImages(questions) {
   return questions;
 }
 
-// Inline dropdowns (Moodle "gapselect") live directly inside .qtext, not inside
+// Inline dropdowns can live directly inside .qtext, not inside
 // a .subquestion wrapper. Each <select> is one blank sharing the same sentence.
 function getInlineSelects(container) {
   if (!container) {
@@ -2569,7 +2760,7 @@ async function extractQuestions() {
   const standardQuestions = [];
 
   for (const questionRoot of getQuestionRoots()) {
-    // Description is an information-only Moodle question type with no
+    // Description blocks contain information only, with no
     // response control. Sending it to an API produces a meaningless hint.
     if (questionRoot.matches(".description")) {
       continue;
@@ -2725,7 +2916,7 @@ function ensurePanel(question) {
   }
 
   const anchor = document.createElement("div");
-  anchor.className = "moodle-hint-anchor";
+  anchor.className = "linguaporta-hint-anchor";
 
   const isAlreadyAnswered = Boolean(question.hasExistingAnswer);
 
@@ -2735,27 +2926,27 @@ function ensurePanel(question) {
   panel.dataset.questionKey = question.key;
   panel.innerHTML = isAlreadyAnswered
     ? `
-    <div class="moodle-hint-header">
-      <div class="moodle-hint-title">${question.label} Hint</div>
-      <div class="moodle-hint-status">Skipped</div>
+    <div class="linguaporta-hint-header">
+      <div class="linguaporta-hint-title">${question.label} Hint</div>
+      <div class="linguaporta-hint-status">Skipped</div>
     </div>
-    <div class="moodle-hint-answer">Already answered — hint not generated.</div>
-    <div class="moodle-hint-reason"></div>
-    <div class="moodle-hint-meta"></div>
-    <div class="moodle-hint-actions">
-      <button class="moodle-hint-retry" type="button">Generate hint</button>
+    <div class="linguaporta-hint-answer">Already answered — hint not generated.</div>
+    <div class="linguaporta-hint-reason"></div>
+    <div class="linguaporta-hint-meta"></div>
+    <div class="linguaporta-hint-actions">
+      <button class="linguaporta-hint-retry" type="button">Generate hint</button>
     </div>
   `
     : `
-    <div class="moodle-hint-header">
-      <div class="moodle-hint-title">${question.label} Hint</div>
-      <div class="moodle-hint-status">Queued</div>
+    <div class="linguaporta-hint-header">
+      <div class="linguaporta-hint-title">${question.label} Hint</div>
+      <div class="linguaporta-hint-status">Queued</div>
     </div>
-    <div class="moodle-hint-answer">Waiting for turn...</div>
-    <div class="moodle-hint-reason"></div>
-    <div class="moodle-hint-meta"></div>
-    <div class="moodle-hint-actions">
-      <button class="moodle-hint-retry" type="button">Retry</button>
+    <div class="linguaporta-hint-answer">Waiting for turn...</div>
+    <div class="linguaporta-hint-reason"></div>
+    <div class="linguaporta-hint-meta"></div>
+    <div class="linguaporta-hint-actions">
+      <button class="linguaporta-hint-retry" type="button">Retry</button>
     </div>
   `;
 
@@ -2773,7 +2964,7 @@ function ensurePanel(question) {
     question.questionRoot.appendChild(anchor);
   }
 
-  const retryButton = panel.querySelector(".moodle-hint-retry");
+  const retryButton = panel.querySelector(".linguaporta-hint-retry");
   if (retryButton) {
     retryButton.addEventListener("click", () => {
       retryHint(question, panel);
@@ -2784,7 +2975,7 @@ function ensurePanel(question) {
 }
 
 function removePanel(panel) {
-  const anchor = panel.closest(".moodle-hint-anchor");
+  const anchor = panel.closest(".linguaporta-hint-anchor");
   if (anchor) {
     anchor.remove();
     return;
@@ -2810,12 +3001,12 @@ function cleanupPanels(questions) {
 
 function updatePanel(panel, payload) {
   panel.dataset.state = payload.state;
-  panel.querySelector(".moodle-hint-status").textContent = payload.status;
-  panel.querySelector(".moodle-hint-answer").textContent = payload.answer;
-  panel.querySelector(".moodle-hint-reason").textContent = payload.reason || "";
-  panel.querySelector(".moodle-hint-meta").textContent = payload.meta || "";
+  panel.querySelector(".linguaporta-hint-status").textContent = payload.status;
+  panel.querySelector(".linguaporta-hint-answer").textContent = payload.answer;
+  panel.querySelector(".linguaporta-hint-reason").textContent = payload.reason || "";
+  panel.querySelector(".linguaporta-hint-meta").textContent = payload.meta || "";
 
-  const retryButton = panel.querySelector(".moodle-hint-retry");
+  const retryButton = panel.querySelector(".linguaporta-hint-retry");
   if (retryButton) {
     retryButton.textContent = payload.state === "manual" ? "Generate hint" : "Retry";
   }
@@ -3352,7 +3543,7 @@ async function hydratePanel(question, panel, options = {}) {
     if (learnedAnswer) {
       parsed = {
         answer: learnedAnswer,
-        reason: "「正解を見る」で保存した正答を使用しました。",
+        reason: "以前に正解した保存済み回答を使用しました。",
         provider: "saved",
         model: "correct-answer",
         audioMode: "",
@@ -3387,6 +3578,9 @@ async function hydratePanel(question, panel, options = {}) {
     }
 
     const appliedCount = applyLinguaportaAnswer(question, parsed.answer);
+    if (appliedCount > 0) {
+      rememberPendingCorrectAnswer(question, parsed.answer);
+    }
     const autoSubmitScheduled =
       appliedCount > 0 &&
       (await scheduleLinguaportaAutoSubmit(question, {
@@ -3500,6 +3694,8 @@ async function processQuestions() {
   if (revealedAnswer) {
     try {
       const learned = await saveLearnedCorrectAnswer(revealedAnswer);
+      await clearConfirmedAnswerAttemptState(learned?.fingerprint);
+      clearPendingCorrectAnswer();
       deferredScanRequested = false;
       clearQueuedTasks();
       cleanupPanels([]);
@@ -3534,7 +3730,16 @@ async function processQuestions() {
     }
   }
 
-  setStatus("scanning", "Scanning page for quiz prompts...", {
+  let confirmedLearnedAnswer = null;
+  if (isLinguaportaCorrectResult(linguaportaRoot)) {
+    try {
+      confirmedLearnedAnswer = await promoteConfirmedCorrectAnswer(linguaportaRoot);
+    } catch (error) {
+      console.warn("Failed to save the confirmed Linguaporta answer:", error);
+    }
+  }
+
+  setStatus("scanning", "Scanning Linguaporta problem...", {
     provider: "",
     model: "",
     audioMode: "",
@@ -3558,8 +3763,12 @@ async function processQuestions() {
     setStatus(
       "idle",
       isAdvancing
-        ? "Correct answer — moving to the next problem..."
-        : "Correct answer — no next problem button found.",
+        ? confirmedLearnedAnswer?.answer
+          ? `Correct answer saved: ${confirmedLearnedAnswer.answer} — moving to the next problem...`
+          : "Correct answer — moving to the next problem..."
+        : confirmedLearnedAnswer?.answer
+          ? `Correct answer saved: ${confirmedLearnedAnswer.answer} — no next problem button found.`
+          : "Correct answer — no next problem button found.",
       {
       questionCount: 0,
       readyCount: 0,
@@ -3575,7 +3784,7 @@ async function processQuestions() {
   runtimeState.questionCount = questions.length;
 
   if (!questions.length) {
-    setStatus("idle", "No quiz prompts found on this page.", {
+    setStatus("idle", "No Linguaporta problem found on this page.", {
       questionCount: 0,
       readyCount: 0,
       errorCount: 0,
@@ -3661,8 +3870,8 @@ function scheduleScan() {
   window.setTimeout(() => {
     scanScheduled = false;
     processQuestions().catch((error) => {
-      console.error("Failed to process quiz hints:", error);
-      setStatus("error", "Failed to process quiz hints.", {
+      console.error("Failed to process Linguaporta hints:", error);
+      setStatus("error", "Failed to process Linguaporta hints.", {
         queueCount: taskQueue.length + activeRequests,
       });
     });
@@ -3763,7 +3972,7 @@ const QUESTION_CONTENT_SELECTOR =
   ".que, .qtext, .formulation, .subquestion, .answer, #problem-area, #question_area, #drill_form, #true_msg, #false_msg, .problem-next-group, .button-next-problem, .qu03, .qu03_line, .DropLine, .CardStyle, audio, source, select, textarea";
 
 // Only a node that adds/removes real question content should trigger a rescan.
-// This ignores the quiz timer, autosave markers, tooltips, and our own panels,
+// This ignores timers, autosave markers, tooltips, and our own panels,
 // which otherwise mutate constantly and cause the same question to be re-solved.
 function isQuestionRelevantNode(node) {
   if (!(node instanceof Element)) {
@@ -3771,7 +3980,7 @@ function isQuestionRelevantNode(node) {
   }
 
   if (
-    node.closest(".moodle-hint-anchor") ||
+    node.closest(".linguaporta-hint-anchor") ||
     node.closest(`#${STATUS_WIDGET_ID}`)
   ) {
     return false;
@@ -3792,7 +4001,7 @@ const observer = new MutationObserver((mutations) => {
 
     if (
       mutationTarget &&
-      (mutationTarget.closest(".moodle-hint-anchor") ||
+      (mutationTarget.closest(".linguaporta-hint-anchor") ||
         mutationTarget.closest(`#${STATUS_WIDGET_ID}`))
     ) {
       return false;
