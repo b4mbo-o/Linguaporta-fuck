@@ -1,0 +1,3312 @@
+﻿const HINT_STYLE_ID = "moodle-hint-style";
+const HINT_PANEL_CLASS = "moodle-hint-panel";
+const STATUS_WIDGET_ID = "moodle-hint-status-widget";
+const PRIMARY_QUESTION_SELECTOR = ".que";
+const FALLBACK_QUESTION_SELECTOR = "[id^='question-']";
+const SUBQUESTION_SELECTOR = ".subquestion";
+const ORDERING_ITEM_SELECTOR = ".answer.ordering [data-itemcontent]";
+const MATCHING_ROW_SELECTOR = ".answer.table-reboot tr";
+const DDWTOS_DROP_SELECTOR = ".qtext .drop[class*='group']";
+const LINGUAPORTA_QUESTION_SELECTOR = "#problem-area";
+const LINGUAPORTA_ANSWER_SELECTOR = "#drill_form";
+const MAX_CONCURRENT_REQUESTS = 2;
+const MAX_IMAGES_PER_QUESTION = 4;
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+const MAX_AUDIO_FILES_PER_QUESTION = 1;
+const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
+const SOL_RETRY_GUARD_STORAGE_KEY = "linguaportaSolRetryGuards";
+const SOL_RETRY_GUARD_TTL_MS = 30 * 60 * 1000;
+
+const answerCache = new Map();
+const imageDataUrlCache = new Map();
+const audioDataUrlCache = new Map();
+const pendingAnswers = new Map();
+const taskQueue = [];
+
+let activeRequests = 0;
+let scanScheduled = false;
+let deferredScanRequested = false;
+let autoAdvanceScheduledKey = "";
+let autoSubmittedButtons = new WeakSet();
+let runtimeActionEpoch = 0;
+const solRetryReservations = new Set();
+
+const runtimeState = {
+  phase: "booting",
+  message: "Starting...",
+  questionCount: 0,
+  readyCount: 0,
+  errorCount: 0,
+  queueCount: 0,
+  lastProvider: "",
+  lastModel: "",
+  lastAudioMode: "",
+};
+
+const DEFAULT_SETTINGS = {
+  enabled: true,
+  pausedUntil: 0,
+  detailedMode: false,
+  showStatusWidget: true,
+  materialMode: false,
+  freeApiMode: false,
+  materialRevision: 0,
+};
+
+let currentSettings = { ...DEFAULT_SETTINGS };
+let settingsLoaded = false;
+
+function normalizeText(value) {
+  return (value || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeSettings(raw = {}) {
+  return {
+    enabled: raw.enabled !== false,
+    pausedUntil: Number(raw.pausedUntil) || 0,
+    detailedMode: Boolean(raw.detailedMode),
+    showStatusWidget: raw.showStatusWidget !== false,
+    materialMode: Boolean(raw.materialMode),
+    freeApiMode: Boolean(raw.freeApiMode),
+    materialRevision: Number(raw.materialRevision) || 0,
+  };
+}
+
+function getRequestCacheKey(question, settings = currentSettings) {
+  return JSON.stringify({
+    questionKey: question.key,
+    incorrectRetry: isLinguaportaIncorrectResult(question.questionRoot),
+    detailedMode: Boolean(settings.detailedMode),
+    materialMode: Boolean(settings.materialMode),
+    freeApiMode: Boolean(settings.freeApiMode),
+    materialRevision: Number(settings.materialRevision) || 0,
+  });
+}
+
+function isPaused(settings = currentSettings) {
+  return !settings.enabled || settings.pausedUntil > Date.now();
+}
+
+function formatPausedUntil(timestamp) {
+  return new Intl.DateTimeFormat("ja-JP", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
+}
+
+function getPausedMessage(settings = currentSettings) {
+  if (!settings.enabled) {
+    return "Stopped. Press 再開 to continue.";
+  }
+
+  if (settings.pausedUntil > Date.now()) {
+    return `Paused until ${formatPausedUntil(settings.pausedUntil)}.`;
+  }
+
+  return "";
+}
+
+function syncStatusWidgetVisibility() {
+  const widget = document.getElementById(STATUS_WIDGET_ID);
+  if (!widget) {
+    return;
+  }
+
+  widget.style.display = currentSettings.showStatusWidget ? "" : "none";
+}
+
+function loadSettings(force = false) {
+  if (settingsLoaded && !force) {
+    return Promise.resolve(currentSettings);
+  }
+
+  return new Promise((resolve) => {
+    chrome.storage.local.get(DEFAULT_SETTINGS, (items) => {
+      currentSettings = normalizeSettings(items);
+      settingsLoaded = true;
+      syncStatusWidgetVisibility();
+      resolve(currentSettings);
+    });
+  });
+}
+
+function renderNodeText(node, options = {}) {
+  const {
+    blankToken = " [blank] ",
+    targetSelect = null,
+    otherSelectToken = " ___ ",
+  } = options;
+
+  if (!node) {
+    return "";
+  }
+
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent || "";
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return "";
+  }
+
+  const element = node;
+
+  if (
+    element.matches(".accesshide, .sr-only, script, style, label.subq") ||
+    element.matches(".moodle-hint-anchor") ||
+    element.matches(`#${STATUS_WIDGET_ID}`)
+  ) {
+    return "";
+  }
+
+  // Inline dropdowns (gapselect). When a target is set, mark it as [blank] and
+  // the others as neutral placeholders. When a counter is set, number them
+  // [1], [2], ... so all blanks can be answered jointly in one request.
+  if (element.matches("select")) {
+    if (targetSelect) {
+      return element === targetSelect ? blankToken : otherSelectToken;
+    }
+    if (options.selectCounter) {
+      options.selectCounter.value += 1;
+      return ` [${options.selectCounter.value}] `;
+    }
+    return blankToken;
+  }
+
+  // Linguaporta ordering questions draw the missing sentence portion as an
+  // empty underlined span rather than a form control.
+  if (element.matches(".qu03_line")) {
+    return blankToken;
+  }
+
+  // Moodle's drag-and-drop-words question type renders blanks as spans
+  // instead of form controls. Treat them exactly like the select-based
+  // missing-word blanks so the model sees their positions.
+  if (element.matches(".drop[class*='group']")) {
+    if (options.blankCounter) {
+      options.blankCounter.value += 1;
+      return ` [${options.blankCounter.value}] `;
+    }
+    return blankToken;
+  }
+
+  if (
+    element.matches(SUBQUESTION_SELECTOR) ||
+    element.matches("input, textarea")
+  ) {
+    // Multi-blank subquestion groups (e.g. several related answers in one
+    // problem). Number every blank [1], [2], ... in document order so the
+    // whole passage can be solved jointly in one request.
+    if (options.blankCounter) {
+      options.blankCounter.value += 1;
+      return ` [${options.blankCounter.value}] `;
+    }
+    return blankToken;
+  }
+
+  if (element.tagName === "SUP") {
+    return `^${renderChildrenText(element, options)}`;
+  }
+
+  if (element.tagName === "BR") {
+    return "\n";
+  }
+
+  const text = renderChildrenText(element, options);
+  if (/^(P|DIV|LI|TR|TD|TH)$/.test(element.tagName)) {
+    return `${text}\n`;
+  }
+
+  return text;
+}
+
+function renderChildrenText(element, options = {}) {
+  return Array.from(element.childNodes)
+    .map((childNode) => renderNodeText(childNode, options))
+    .join("");
+}
+
+function ensureStyles() {
+  if (document.getElementById(HINT_STYLE_ID)) {
+    return;
+  }
+
+  const style = document.createElement("style");
+  style.id = HINT_STYLE_ID;
+  style.textContent = `
+    .moodle-hint-anchor {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 12px;
+    }
+
+    .${HINT_PANEL_CLASS} {
+      width: min(360px, 100%);
+      box-sizing: border-box;
+      border: 1px solid rgba(15, 23, 42, 0.12);
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fff7ed 0%, #ffffff 100%);
+      box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+      color: #1f2937;
+      padding: 14px 16px;
+      font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="loading"] {
+      background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="error"] {
+      background: linear-gradient(180deg, #fff1f2 0%, #ffffff 100%);
+      border-color: rgba(190, 24, 93, 0.16);
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="manual"] {
+      background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+      border-color: rgba(15, 23, 42, 0.1);
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="manual"] .moodle-hint-answer {
+      color: #64748b;
+      font-weight: 600;
+    }
+
+    .moodle-hint-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+
+    .moodle-hint-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: #9a3412;
+    }
+
+    .moodle-hint-status {
+      font-size: 12px;
+      color: #64748b;
+      white-space: nowrap;
+    }
+
+    .moodle-hint-answer {
+      font-size: 16px;
+      font-weight: 700;
+      color: #0f172a;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .moodle-hint-reason {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #475569;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .moodle-hint-meta {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #64748b;
+    }
+
+    .moodle-hint-actions {
+      margin-top: 10px;
+      display: none;
+      justify-content: flex-end;
+    }
+
+    .${HINT_PANEL_CLASS}[data-state="error"] .moodle-hint-actions,
+    .${HINT_PANEL_CLASS}[data-state="manual"] .moodle-hint-actions {
+      display: flex;
+    }
+
+    .moodle-hint-retry {
+      appearance: none;
+      border: 1px solid rgba(15, 23, 42, 0.18);
+      border-radius: 8px;
+      background: #ffffff;
+      color: #0f172a;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+
+    .moodle-hint-retry:hover {
+      border-color: rgba(15, 23, 42, 0.34);
+    }
+
+    .moodle-hint-reason:empty,
+    .moodle-hint-meta:empty {
+      display: none;
+    }
+
+    #${STATUS_WIDGET_ID} {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 2147483647;
+      width: min(320px, calc(100vw - 32px));
+      box-sizing: border-box;
+      border: 1px solid rgba(15, 23, 42, 0.14);
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.92);
+      color: #f8fafc;
+      box-shadow: 0 16px 36px rgba(15, 23, 42, 0.28);
+      padding: 14px 16px;
+      font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      backdrop-filter: blur(8px);
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="running"] {
+      background: rgba(3, 105, 161, 0.94);
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="ready"] {
+      background: rgba(15, 118, 110, 0.94);
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="idle"] {
+      background: rgba(51, 65, 85, 0.94);
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="error"] {
+      background: rgba(159, 18, 57, 0.95);
+    }
+
+    .moodle-status-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    .moodle-status-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .moodle-status-toggle {
+      appearance: none;
+      border: 1px solid rgba(255, 255, 255, 0.55);
+      border-radius: 8px;
+      background: rgba(127, 29, 29, 0.9);
+      color: #ffffff;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      padding: 7px 10px;
+      cursor: pointer;
+      text-transform: none;
+    }
+
+    .moodle-status-toggle:hover {
+      background: rgba(153, 27, 27, 0.98);
+    }
+
+    .moodle-status-toggle[data-paused="true"] {
+      background: rgba(4, 120, 87, 0.95);
+    }
+
+    .moodle-status-toggle[data-paused="true"]:hover {
+      background: rgba(5, 150, 105, 0.98);
+    }
+
+    .moodle-status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: rgba(248, 250, 252, 0.92);
+    }
+
+    .moodle-status-pill::before {
+      content: "";
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: #f59e0b;
+      box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.12);
+      flex: none;
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="running"] .moodle-status-pill::before {
+      background: #38bdf8;
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="ready"] .moodle-status-pill::before {
+      background: #34d399;
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="idle"] .moodle-status-pill::before {
+      background: #94a3b8;
+    }
+
+    #${STATUS_WIDGET_ID}[data-phase="error"] .moodle-status-pill::before {
+      background: #fb7185;
+    }
+
+    .moodle-status-message {
+      margin-top: 10px;
+      font-size: 14px;
+      line-height: 1.5;
+      color: #f8fafc;
+    }
+
+    .moodle-status-meta {
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: rgba(226, 232, 240, 0.9);
+      white-space: pre-wrap;
+    }
+
+    @media (max-width: 900px) {
+      .moodle-hint-anchor {
+        justify-content: stretch;
+      }
+
+      .${HINT_PANEL_CLASS} {
+        width: 100%;
+      }
+
+      #${STATUS_WIDGET_ID} {
+        right: 12px;
+        left: 12px;
+        bottom: 12px;
+        width: auto;
+      }
+    }
+  `;
+
+  (document.head || document.documentElement).appendChild(style);
+}
+
+function buildQuestionKey(
+  questionText,
+  options,
+  uniqueId = "",
+  imageUrls = [],
+  audioUrls = []
+) {
+  return JSON.stringify({
+    questionText,
+    options,
+    uniqueId,
+    imageUrls,
+    audioUrls,
+  });
+}
+
+function ensureStatusWidget() {
+  let widget = document.getElementById(STATUS_WIDGET_ID);
+  if (widget) {
+    syncStatusWidgetVisibility();
+    return widget;
+  }
+
+  widget = document.createElement("aside");
+  widget.id = STATUS_WIDGET_ID;
+  widget.dataset.phase = "booting";
+  widget.innerHTML = `
+    <div class="moodle-status-title">
+      <span>LinguaportaFuck</span>
+      <span class="moodle-status-controls">
+        <span class="moodle-status-pill">Booting</span>
+        <button class="moodle-status-toggle" type="button">停止</button>
+      </span>
+    </div>
+    <div class="moodle-status-message">Content script started.</div>
+    <div class="moodle-status-meta">Waiting for page scan...</div>
+  `;
+
+  widget
+    .querySelector(".moodle-status-toggle")
+    .addEventListener("click", toggleRuntimeFromStatusWidget);
+
+  (document.body || document.documentElement).appendChild(widget);
+  syncStatusWidgetVisibility();
+  return widget;
+}
+
+function updateStatusToggle(widget) {
+  const button = widget?.querySelector(".moodle-status-toggle");
+  if (!button) {
+    return;
+  }
+
+  const paused = isPaused(currentSettings);
+  button.textContent = paused ? "再開" : "停止";
+  button.dataset.paused = String(paused);
+  button.setAttribute("aria-label", paused ? "自動回答を再開" : "自動回答を停止");
+}
+
+function toggleRuntimeFromStatusWidget() {
+  if (isPaused(currentSettings)) {
+    currentSettings = {
+      ...currentSettings,
+      enabled: true,
+      pausedUntil: 0,
+    };
+    settingsLoaded = true;
+    setStatus("scanning", "Resuming...", { queueCount: 0 });
+    chrome.storage.local.set({ enabled: true, pausedUntil: 0 }, () => {
+      scheduleScan();
+    });
+    return;
+  }
+
+  currentSettings = {
+    ...currentSettings,
+    enabled: false,
+    pausedUntil: 0,
+  };
+  settingsLoaded = true;
+  runtimeActionEpoch += 1;
+  autoAdvanceScheduledKey = "";
+  autoSubmittedButtons = new WeakSet();
+  deferredScanRequested = false;
+  clearQueuedTasks();
+  resetPanelLoadState();
+  markLoadingPanelsPaused(getPausedMessage(currentSettings));
+  setStatus("idle", getPausedMessage(currentSettings), {
+    queueCount: activeRequests,
+  });
+  chrome.storage.local.set({ enabled: false, pausedUntil: 0 });
+}
+
+function setStatus(phase, message, extra = {}) {
+  runtimeState.phase = phase;
+  runtimeState.message = message;
+  runtimeState.questionCount = extra.questionCount ?? runtimeState.questionCount;
+  runtimeState.readyCount = extra.readyCount ?? runtimeState.readyCount;
+  runtimeState.errorCount = extra.errorCount ?? runtimeState.errorCount;
+  runtimeState.queueCount = extra.queueCount ?? runtimeState.queueCount;
+  runtimeState.lastProvider = extra.provider ?? runtimeState.lastProvider;
+  runtimeState.lastModel = extra.model ?? runtimeState.lastModel;
+  runtimeState.lastAudioMode = extra.audioMode ?? runtimeState.lastAudioMode;
+
+  const widget = ensureStatusWidget();
+  widget.dataset.phase = phase;
+
+  const labelMap = {
+    booting: "Booting",
+    scanning: "Scanning",
+    running: "Working",
+    ready: "Ready",
+    idle: "Idle",
+    error: "Error",
+  };
+
+  const meta = [
+    `Questions: ${runtimeState.questionCount}`,
+    `Ready: ${runtimeState.readyCount}`,
+    `Errors: ${runtimeState.errorCount}`,
+    `Queue: ${runtimeState.queueCount}`,
+    runtimeState.lastProvider ? `Provider: ${runtimeState.lastProvider}` : "",
+    runtimeState.lastModel ? `Model: ${runtimeState.lastModel}` : "",
+    runtimeState.lastAudioMode ? `Audio: ${runtimeState.lastAudioMode}` : "",
+  ].filter(Boolean).join(" | ");
+
+  widget.querySelector(".moodle-status-pill").textContent =
+    labelMap[phase] || phase;
+  widget.querySelector(".moodle-status-message").textContent = message;
+  widget.querySelector(".moodle-status-meta").textContent = meta;
+  updateStatusToggle(widget);
+}
+
+function getFallbackRootFromQuestionText(questionNode) {
+  let current = questionNode.parentElement;
+
+  while (current && current !== document.body && current !== document.documentElement) {
+    if (current.querySelector(".answer") || current.querySelector(SUBQUESTION_SELECTOR)) {
+      return current;
+    }
+
+    current = current.parentElement;
+  }
+
+  return questionNode.parentElement;
+}
+
+function isLinguaportaQuestionRoot(questionRoot) {
+  return Boolean(
+    questionRoot?.matches?.(LINGUAPORTA_QUESTION_SELECTOR) &&
+      questionRoot.querySelector("form[name='ExpForm']") &&
+      questionRoot.querySelector("#question_area")
+  );
+}
+
+function getAnswerRoot(questionRoot) {
+  if (isLinguaportaQuestionRoot(questionRoot)) {
+    return questionRoot.querySelector(LINGUAPORTA_ANSWER_SELECTOR);
+  }
+
+  return questionRoot.querySelector(".answer");
+}
+
+function getLinguaportaQuestionId(questionRoot) {
+  return normalizeText(
+    questionRoot.querySelector("input[name='xlast_problem_num']")?.value ||
+      questionRoot.querySelector("input[name='click_verify']")?.value ||
+      ""
+  );
+}
+
+function getLinguaportaControlText(answerRoot, control) {
+  if (!answerRoot || !control) {
+    return "";
+  }
+
+  const label = Array.from(answerRoot.querySelectorAll("label")).find(
+    (candidate) => candidate.htmlFor && candidate.htmlFor === control.id
+  );
+  return normalizeText(
+    label?.innerText || label?.textContent || control.value || ""
+  );
+}
+
+function normalizeChoiceMatchText(value) {
+  return normalizeText(value)
+    .normalize("NFKC")
+    .replace(/[~\u301C\uFF5E]/g, "~")
+    .replace(/\s+/g, "")
+    .toLocaleLowerCase();
+}
+
+function getAnsweredOptionKeys(question, answerText) {
+  const rawParts =
+    question.targetType === "multiple_choice"
+      ? String(answerText || "").split(/\s*\|\|\s*/u)
+      : [String(answerText || "")];
+  const answerKeys = new Set(
+    rawParts.map(normalizeChoiceMatchText).filter(Boolean)
+  );
+
+  return new Set(
+    (question.options || [])
+      .filter((option) => answerKeys.has(normalizeChoiceMatchText(option)))
+      .map(normalizeChoiceMatchText)
+  );
+}
+
+function getLinguaportaControlLine(answerRoot, control) {
+  if (!answerRoot || !control || !answerRoot.contains(control)) {
+    return "";
+  }
+
+  let topLevelNode = control;
+  while (topLevelNode.parentNode && topLevelNode.parentNode !== answerRoot) {
+    topLevelNode = topLevelNode.parentNode;
+  }
+
+  const childNodes = Array.from(answerRoot.childNodes);
+  const controlIndex = childNodes.indexOf(topLevelNode);
+  if (controlIndex < 0) {
+    return normalizeText(renderNodeText(topLevelNode));
+  }
+
+  let startIndex = controlIndex;
+  while (
+    startIndex > 0 &&
+    !(childNodes[startIndex - 1] instanceof Element &&
+      childNodes[startIndex - 1].tagName === "BR")
+  ) {
+    startIndex -= 1;
+  }
+
+  let endIndex = controlIndex;
+  while (
+    endIndex + 1 < childNodes.length &&
+    !(childNodes[endIndex + 1] instanceof Element &&
+      childNodes[endIndex + 1].tagName === "BR")
+  ) {
+    endIndex += 1;
+  }
+
+  return normalizeText(
+    childNodes
+      .slice(startIndex, endIndex + 1)
+      .map((node) => renderNodeText(node))
+      .join("")
+  );
+}
+
+function extractLinguaportaAnswerPrompt(answerRoot) {
+  if (!answerRoot) {
+    return "";
+  }
+
+  const inlineAnswerControls = Array.from(
+    answerRoot.querySelectorAll(
+      "input[type='text'], input[type='number'], textarea, select"
+    )
+  );
+  const lines = inlineAnswerControls
+    .map((control) => getLinguaportaControlLine(answerRoot, control))
+    .filter(Boolean);
+
+  return Array.from(new Set(lines)).join("\n");
+}
+
+function extractLinguaportaOrderingOptions(questionRoot) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return [];
+  }
+
+  return Array.from(
+    questionRoot.querySelectorAll("#question_area .CardStyle[id^='D']")
+  )
+    .map((card) => normalizeText(renderNodeText(card)))
+    .filter(Boolean);
+}
+
+function hasLinguaportaOrderingLayout(questionRoot) {
+  return Boolean(
+    isLinguaportaQuestionRoot(questionRoot) &&
+      questionRoot.querySelector("#question_area .qu03_line") &&
+      questionRoot.querySelector("#question_area .DropLine") &&
+      questionRoot.querySelector("#question_area .CardStyle[id^='D']")
+  );
+}
+
+function parseLinguaportaOrderingAnswer(question, answerText) {
+  const options = question.options || [];
+  const optionBuckets = new Map();
+  for (const option of options) {
+    const key = normalizeChoiceMatchText(option);
+    const bucket = optionBuckets.get(key) || [];
+    bucket.push(option);
+    optionBuckets.set(key, bucket);
+  }
+
+  const ordered = String(answerText || "")
+    .split(/\s*\u2192\s*/u)
+    .map((part) => normalizeText(part))
+    .filter(Boolean)
+    .map((part) => {
+      const bucket = optionBuckets.get(normalizeChoiceMatchText(part));
+      return bucket?.shift() || "";
+    });
+
+  if (
+    ordered.length !== options.length ||
+    ordered.some((option) => !option) ||
+    Array.from(optionBuckets.values()).some((bucket) => bucket.length)
+  ) {
+    return [];
+  }
+
+  return ordered;
+}
+
+function applyLinguaportaOrderingAnswer(question, answerText) {
+  const orderedOptions = parseLinguaportaOrderingAnswer(question, answerText);
+  const questionRoot = question.questionRoot;
+  const dropLines = Array.from(
+    questionRoot.querySelectorAll("#question_area .DropLine")
+  );
+  const cards = Array.from(
+    questionRoot.querySelectorAll("#question_area .CardStyle[id^='D']")
+  );
+  if (
+    !orderedOptions.length ||
+    !dropLines.length ||
+    cards.length !== orderedOptions.length
+  ) {
+    return 0;
+  }
+
+  const cardBuckets = new Map();
+  for (const card of cards) {
+    const key = normalizeChoiceMatchText(renderNodeText(card));
+    const bucket = cardBuckets.get(key) || [];
+    bucket.push(card);
+    cardBuckets.set(key, bucket);
+  }
+
+  const orderedCards = orderedOptions.map((option) =>
+    cardBuckets.get(normalizeChoiceMatchText(option))?.shift()
+  );
+  if (orderedCards.some((card) => !card)) {
+    return 0;
+  }
+
+  let lineIndex = 0;
+  let usedWidth = 0;
+  for (const card of orderedCards) {
+    const width =
+      card.offsetWidth || Math.round(card.getBoundingClientRect().width) || 36;
+    let dropLine = dropLines[lineIndex];
+    const availableWidth = Math.max(
+      dropLine.offsetWidth,
+      dropLine.getBoundingClientRect().width
+    );
+
+    if (
+      usedWidth > 0 &&
+      usedWidth + width > availableWidth &&
+      lineIndex < dropLines.length - 1
+    ) {
+      lineIndex += 1;
+      usedWidth = 0;
+      dropLine = dropLines[lineIndex];
+    }
+
+    // Linguaporta's GetGuessSequence() only counts a card when its exact top
+    // equals: DropLine bottom - (card height + 2). Set that same coordinate
+    // directly; synthetic drag events were unreliable in Chromium.
+    const height =
+      card.offsetHeight || Math.round(card.getBoundingClientRect().height) || 20;
+    const cardLeft = dropLine.offsetLeft + usedWidth;
+    const cardTop = dropLine.offsetTop + dropLine.offsetHeight - (height + 2);
+    card.style.left = `${Math.round(cardLeft)}px`;
+    card.style.top = `${Math.round(cardTop)}px`;
+    usedWidth += width + 5;
+  }
+
+  return orderedCards.length;
+}
+
+function dispatchAnswerControlEvents(control) {
+  control.dispatchEvent(new Event("input", { bubbles: true }));
+  control.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function applyLinguaportaAnswer(question, answerText) {
+  if (
+    !isLinguaportaQuestionRoot(question.questionRoot) ||
+    question.hasExistingAnswer ||
+    isLinguaportaCorrectResult(question.questionRoot)
+  ) {
+    return 0;
+  }
+
+  if (question.targetType === "ordering") {
+    return applyLinguaportaOrderingAnswer(question, answerText);
+  }
+
+  const answerRoot = getAnswerRoot(question.questionRoot);
+  if (!answerRoot) {
+    return 0;
+  }
+
+  const textControls = Array.from(
+    answerRoot.querySelectorAll("input[type='text'], input[type='number'], textarea")
+  ).filter((control) => !control.disabled && !control.readOnly);
+  if (!question.options?.length && textControls.length === 1) {
+    const value = String(answerText || "").trim();
+    if (!value) {
+      return 0;
+    }
+
+    const control = textControls[0];
+    if (control.value !== value) {
+      control.value = value;
+      dispatchAnswerControlEvents(control);
+    }
+    return 1;
+  }
+
+  const answeredOptionKeys = getAnsweredOptionKeys(question, answerText);
+  if (!answeredOptionKeys.size) {
+    return 0;
+  }
+
+  let selectedCount = 0;
+  const choiceControls = Array.from(
+    answerRoot.querySelectorAll("input[type='radio'], input[type='checkbox']")
+  );
+
+  for (const control of choiceControls) {
+    const labelKey = normalizeChoiceMatchText(
+      getLinguaportaControlText(answerRoot, control)
+    );
+    const valueKey = normalizeChoiceMatchText(control.value);
+    const shouldSelect =
+      answeredOptionKeys.has(labelKey) || answeredOptionKeys.has(valueKey);
+
+    if (control.checked !== shouldSelect) {
+      control.checked = shouldSelect;
+      dispatchAnswerControlEvents(control);
+    }
+    if (shouldSelect) {
+      selectedCount += 1;
+    }
+  }
+
+  for (const select of Array.from(answerRoot.querySelectorAll("select"))) {
+    const matchingOption = Array.from(select.options).find((option) => {
+      const textKey = normalizeChoiceMatchText(
+        option.textContent || option.innerText || ""
+      );
+      const valueKey = normalizeChoiceMatchText(option.value);
+      return answeredOptionKeys.has(textKey) || answeredOptionKeys.has(valueKey);
+    });
+    if (!matchingOption) {
+      continue;
+    }
+
+    if (select.value !== matchingOption.value) {
+      select.value = matchingOption.value;
+      dispatchAnswerControlEvents(select);
+    }
+    selectedCount += 1;
+  }
+
+  return selectedCount;
+}
+
+function extractLinguaportaQuestionText(questionRoot) {
+  const questionArea = questionRoot.querySelector("#question_area");
+  if (!questionArea) {
+    return "";
+  }
+
+  // Linguaporta renders prompts as qu01, qu02, ... and keeps the answer
+  // controls under #drill_form. Reading all of #question_area would mix every
+  // answer label into the prompt, so prefer the numbered prompt nodes.
+  const numberedPromptNodes = Array.from(questionArea.querySelectorAll("[id]")).filter(
+    (element) => /^qu\d+$/i.test(element.id)
+  );
+  const promptParts = numberedPromptNodes
+    .map((element) => normalizeText(renderNodeText(element)))
+    .filter(Boolean);
+  const answerPrompt = extractLinguaportaAnswerPrompt(
+    questionRoot.querySelector(LINGUAPORTA_ANSWER_SELECTOR)
+  );
+  const orderingPrompt = normalizeText(
+    renderNodeText(questionArea.querySelector(".qu03"))
+  );
+
+  if (promptParts.length) {
+    return [...promptParts, orderingPrompt, answerPrompt]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // Fallback for other exercise templates: render the question area while
+  // excluding any branch that contains #drill_form.
+  return normalizeText(
+    Array.from(questionArea.childNodes)
+      .filter((node) => {
+        if (!(node instanceof Element)) {
+          return true;
+        }
+        return !(
+          node.matches(LINGUAPORTA_ANSWER_SELECTOR) ||
+          node.querySelector(LINGUAPORTA_ANSWER_SELECTOR)
+        );
+      })
+      .map((node) => renderNodeText(node))
+      .join("\n")
+  );
+}
+
+function isLinguaportaCorrectResult(questionRoot) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return false;
+  }
+
+  // Linguaporta uses this marker for the result screen across exercise types.
+  // Keep a class/text fallback for templates that omit the legacy id.
+  if (questionRoot.querySelector("#true_msg")) {
+    return true;
+  }
+
+  return Array.from(questionRoot.querySelectorAll(".problem-mark-ok")).some(
+    (marker) => /(?:正解|correct)/i.test(normalizeText(marker.textContent))
+  );
+}
+
+function isLinguaportaIncorrectResult(questionRoot) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return false;
+  }
+
+  if (questionRoot.querySelector("#false_msg")) {
+    return true;
+  }
+
+  return Array.from(questionRoot.querySelectorAll(".problem-mark-ng")).some(
+    (marker) => /(?:不正解|incorrect|wrong)/i.test(normalizeText(marker.textContent))
+  );
+}
+
+function findLinguaportaNextProblemButton() {
+  return Array.from(
+    document.querySelectorAll(
+      ".problem-next-group input.button-next-problem[type='submit']"
+    )
+  ).find((button) => {
+    const label = normalizeText(button.value || button.textContent);
+    const action = normalizeText(
+      button.form?.querySelector("input[type='hidden'][name='action']")?.value
+    );
+    return !button.disabled && label === "次の問題" && action === "次の問題";
+  });
+}
+
+function scheduleLinguaportaAutoAdvance(questionRoot) {
+  if (!isLinguaportaCorrectResult(questionRoot)) {
+    return false;
+  }
+
+  const nextButton = findLinguaportaNextProblemButton();
+  if (!nextButton) {
+    return false;
+  }
+
+  const questionKey =
+    getLinguaportaQuestionId(questionRoot) ||
+    normalizeText(questionRoot.querySelector("#true_msg")?.textContent) ||
+    "correct-result";
+  if (autoAdvanceScheduledKey === questionKey) {
+    return true;
+  }
+  autoAdvanceScheduledKey = questionKey;
+  const actionEpoch = runtimeActionEpoch;
+
+  window.setTimeout(() => {
+    const currentRoot = document.querySelector(LINGUAPORTA_QUESTION_SELECTOR);
+    if (
+      actionEpoch !== runtimeActionEpoch ||
+      isPaused(currentSettings) ||
+      !isLinguaportaCorrectResult(currentRoot) ||
+      getLinguaportaQuestionId(currentRoot) !== getLinguaportaQuestionId(questionRoot)
+    ) {
+      return;
+    }
+
+    const currentNextButton = findLinguaportaNextProblemButton();
+    if (currentNextButton) {
+      currentNextButton.click();
+    }
+  }, 500);
+
+  return true;
+}
+
+function findLinguaportaAnswerButton(questionRoot, allowRetry = false) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return null;
+  }
+
+  const button = questionRoot.querySelector("#ans_submit");
+  if (!button || button.disabled) {
+    return null;
+  }
+
+  const label = normalizeText(button.value || button.textContent);
+  if (label === "解答する") {
+    return button;
+  }
+
+  return allowRetry && label === "もう一度解答する" ? button : null;
+}
+
+function getSolRetryFingerprint(question) {
+  const stableQuestion = JSON.stringify({
+    questionText: normalizeText(question?.questionText || ""),
+    options: Array.isArray(question?.options)
+      ? question.options.map((option) => normalizeText(option))
+      : [],
+    targetType: normalizeText(question?.targetType || "standard"),
+  });
+  let hash = 2166136261;
+  for (let index = 0; index < stableQuestion.length; index += 1) {
+    hash ^= stableQuestion.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function reserveSolAutoRetry(question) {
+  const fingerprint = getSolRetryFingerprint(question);
+  if (solRetryReservations.has(fingerprint)) {
+    return Promise.resolve(false);
+  }
+  solRetryReservations.add(fingerprint);
+
+  return new Promise((resolve) => {
+    chrome.storage.local.get(
+      { [SOL_RETRY_GUARD_STORAGE_KEY]: {} },
+      (items) => {
+        if (chrome.runtime.lastError) {
+          solRetryReservations.delete(fingerprint);
+          resolve(false);
+          return;
+        }
+
+        const now = Date.now();
+        const storedGuards = items?.[SOL_RETRY_GUARD_STORAGE_KEY];
+        const guards =
+          storedGuards && typeof storedGuards === "object" && !Array.isArray(storedGuards)
+            ? { ...storedGuards }
+            : {};
+        for (const [key, timestamp] of Object.entries(guards)) {
+          if (now - Number(timestamp) > SOL_RETRY_GUARD_TTL_MS) {
+            delete guards[key];
+          }
+        }
+
+        if (Number(guards[fingerprint]) > 0) {
+          resolve(false);
+          return;
+        }
+
+        // Reserve before clicking. The form can navigate immediately, so the
+        // next page must already know this question consumed its one retry.
+        guards[fingerprint] = now;
+        chrome.storage.local.set(
+          { [SOL_RETRY_GUARD_STORAGE_KEY]: guards },
+          () => {
+            if (chrome.runtime.lastError) {
+              solRetryReservations.delete(fingerprint);
+              resolve(false);
+              return;
+            }
+            resolve(true);
+          }
+        );
+      }
+    );
+  });
+}
+
+async function scheduleLinguaportaAutoSubmit(question, result = {}) {
+  const questionRoot = question?.questionRoot;
+  if (
+    !isLinguaportaQuestionRoot(questionRoot) ||
+    isLinguaportaCorrectResult(questionRoot)
+  ) {
+    return false;
+  }
+
+  const isIncorrect = isLinguaportaIncorrectResult(questionRoot);
+  const isSolRetry =
+    isIncorrect &&
+    normalizeText(result.provider).toLowerCase() === "openai" &&
+    normalizeText(result.model).toLowerCase() === "gpt-5.6-sol";
+  if (isIncorrect && !isSolRetry) {
+    return false;
+  }
+  if (isSolRetry && !(await reserveSolAutoRetry(question))) {
+    return false;
+  }
+
+  const answerButton = findLinguaportaAnswerButton(questionRoot, isSolRetry);
+  if (!answerButton || autoSubmittedButtons.has(answerButton)) {
+    return false;
+  }
+  autoSubmittedButtons.add(answerButton);
+  const actionEpoch = runtimeActionEpoch;
+
+  window.setTimeout(() => {
+    if (
+      actionEpoch !== runtimeActionEpoch ||
+      isPaused(currentSettings) ||
+      !questionRoot.isConnected ||
+      isLinguaportaCorrectResult(questionRoot) ||
+      findLinguaportaAnswerButton(questionRoot, isSolRetry) !== answerButton
+    ) {
+      return;
+    }
+    answerButton.click();
+  }, 500);
+
+  return true;
+}
+
+function getQuestionRoots() {
+  const linguaportaRoot = document.querySelector(LINGUAPORTA_QUESTION_SELECTOR);
+  if (linguaportaRoot && isLinguaportaQuestionRoot(linguaportaRoot)) {
+    if (isLinguaportaCorrectResult(linguaportaRoot)) {
+      return [];
+    }
+    return [linguaportaRoot];
+  }
+
+  const primaryRoots = Array.from(
+    document.querySelectorAll(PRIMARY_QUESTION_SELECTOR)
+  ).filter((root) => !root.matches(".ordering.dragproxy"));
+  if (primaryRoots.length) {
+    return primaryRoots;
+  }
+
+  const fallbackRoots = Array.from(
+    document.querySelectorAll(FALLBACK_QUESTION_SELECTOR)
+  );
+  if (fallbackRoots.length) {
+    return fallbackRoots;
+  }
+
+  const derivedRoots = Array.from(document.querySelectorAll(".qtext"))
+    .map((questionNode) => getFallbackRootFromQuestionText(questionNode))
+    .filter(Boolean);
+
+  return Array.from(new Set(derivedRoots));
+}
+
+function getOwningQuestionRoot(element) {
+  return (
+    element.closest(LINGUAPORTA_QUESTION_SELECTOR) ||
+    element.closest(".que") ||
+    element.closest("[id^='question-']") ||
+    element.closest(".content") ||
+    element.closest(".formulation") ||
+    element.parentElement
+  );
+}
+
+function getQuestionLabel(questionRoot) {
+  if (isLinguaportaQuestionRoot(questionRoot)) {
+    return "Linguaporta Question";
+  }
+
+  const qno = normalizeText(questionRoot.querySelector(".qno")?.textContent);
+  if (qno) {
+    return `Question ${qno}`;
+  }
+
+  const heading = normalizeText(questionRoot.querySelector(".no")?.textContent);
+  return heading || "Question";
+}
+
+function extractQuestionText(questionRoot) {
+  if (isLinguaportaQuestionRoot(questionRoot)) {
+    return extractLinguaportaQuestionText(questionRoot);
+  }
+
+  const questionNode = questionRoot.querySelector(".qtext");
+  if (questionNode) {
+    return normalizeText(renderNodeText(questionNode));
+  }
+
+  const formulation =
+    questionRoot.matches(".formulation")
+      ? questionRoot
+      : questionRoot.querySelector(".formulation");
+
+  if (!formulation) {
+    return "";
+  }
+
+  return normalizeText(renderNodeText(formulation));
+}
+
+function isFormControlFilled(element) {
+  if (!element) {
+    return false;
+  }
+
+  if (element.tagName === "SELECT") {
+    const value = normalizeText(element.value);
+    // Moodle matching questions use value="0" for the unselected
+    // "Choose..." entry. Treating it as filled suppresses every hint.
+    return Boolean(value && value !== "0");
+  }
+
+  if (element.type === "checkbox" || element.type === "radio") {
+    return Boolean(element.checked);
+  }
+
+  return Boolean(normalizeText(element.value));
+}
+
+function anyFormControlFilled(elements) {
+  return (elements || []).some((element) => isFormControlFilled(element));
+}
+
+function answerRootHasExistingAnswer(questionRoot) {
+  const answerRoot = getAnswerRoot(questionRoot);
+  if (!answerRoot) {
+    return false;
+  }
+
+  // Linguaporta may preserve the submitted value on a retry page.  A visible
+  // #false_msg means that value is an incorrect prior attempt, not a completed
+  // answer that should suppress regeneration or automatic correction.
+  if (
+    isLinguaportaQuestionRoot(questionRoot) &&
+    questionRoot.querySelector("#false_msg")
+  ) {
+    return false;
+  }
+
+  // Moodle checkbox groups pair each visible checkbox with a hidden input
+  // carrying the "unchecked" fallback value (e.g. value="0"). That hidden
+  // input always has a non-empty value, so it must be excluded here or
+  // every checkbox question would look "already answered".
+  return anyFormControlFilled(
+    Array.from(
+      answerRoot.querySelectorAll("input:not([type='hidden']), textarea, select")
+    )
+  );
+}
+
+function extractOptions(questionRoot) {
+  const answerRoot = getAnswerRoot(questionRoot);
+  if (!answerRoot) {
+    return [];
+  }
+
+  if (isLinguaportaQuestionRoot(questionRoot)) {
+    const results = [];
+    const seen = new Set();
+    const controls = Array.from(
+      answerRoot.querySelectorAll(
+        "input[type='radio'], input[type='checkbox'], select"
+      )
+    );
+
+    for (const control of controls) {
+      if (control.tagName === "SELECT") {
+        for (const optionText of extractSelectOptions(control)) {
+          if (!seen.has(optionText)) {
+            seen.add(optionText);
+            results.push(optionText);
+          }
+        }
+        continue;
+      }
+
+      const text = getLinguaportaControlText(answerRoot, control);
+      if (text && !seen.has(text)) {
+        seen.add(text);
+        results.push(text);
+      }
+    }
+
+    return results;
+  }
+
+  const candidateGroups = [
+    answerRoot.querySelectorAll("[data-region='answer-label']"),
+    answerRoot.querySelectorAll("label"),
+    answerRoot.querySelectorAll("option"),
+    answerRoot.querySelectorAll(":scope > div"),
+  ];
+
+  const results = [];
+  const seen = new Set();
+
+  for (const candidates of candidateGroups) {
+    for (const element of candidates) {
+      if (
+        element.closest(".qtype_multichoice_clearchoice") ||
+        (element.matches("option") && !normalizeText(element.value))
+      ) {
+        continue;
+      }
+
+      const text = normalizeText(element.innerText || element.textContent || "");
+      if (!text) {
+        continue;
+      }
+
+      if (
+        /^(clear my choice|reset answer)$/i.test(text) ||
+        text.includes("\u30af\u30ea\u30a2") ||
+        seen.has(text)
+      ) {
+        continue;
+      }
+
+      seen.add(text);
+      results.push(text);
+    }
+
+    if (results.length) {
+      return results;
+    }
+  }
+
+  return results;
+}
+
+function getChoiceTargetType(questionRoot) {
+  const answerRoot = getAnswerRoot(questionRoot);
+  if (!answerRoot) {
+    return "";
+  }
+
+  if (isLinguaportaQuestionRoot(questionRoot)) {
+    const checkboxes = answerRoot.querySelectorAll("input[type='checkbox']");
+    if (checkboxes.length) {
+      return "multiple_choice";
+    }
+
+    if (
+      answerRoot.querySelector("input[type='radio']") ||
+      answerRoot.querySelector("select")
+    ) {
+      return "single_choice";
+    }
+
+    return "";
+  }
+
+  const choiceControls = Array.from(
+    answerRoot.querySelectorAll("input[type='radio'], input[type='checkbox']")
+  ).filter((input) => !input.closest(".qtype_multichoice_clearchoice"));
+  if (!choiceControls.length) {
+    return "";
+  }
+
+  // Numerical questions may render their unit selector as radios alongside a
+  // text input. Those radios are not the answer choices for the question.
+  const hasNonChoiceControl = Boolean(
+    answerRoot.querySelector(
+      "input:not([type='hidden']):not([type='radio']):not([type='checkbox']), textarea, select"
+    )
+  );
+  const isKnownChoiceType = questionRoot.matches(
+    ".multichoice, .truefalse, .calculatedmulti"
+  );
+  if (hasNonChoiceControl && !isKnownChoiceType) {
+    return "";
+  }
+
+  return choiceControls.some((input) => input.type === "checkbox")
+    ? "multiple_choice"
+    : "single_choice";
+}
+
+function getPromptContainer(subquestion) {
+  return (
+    subquestion.closest("p, li, td, th") ||
+    subquestion.parentElement ||
+    subquestion
+  );
+}
+
+// Walks `root`'s children in document order, collecting rendered text for
+// every node that comes strictly BEFORE `targetNode`. When a child contains
+// the target (e.g. a <ul> wrapping several <li> blanks), it recurses into
+// that child instead of skipping it wholesale, so earlier siblings inside
+// the same wrapper (e.g. an earlier <li> in the same list) are still
+// captured — then stops, since nothing after that ancestor at this level
+// can precede the target. Returns true once the target has been reached.
+function collectTextBeforeNode(root, targetNode, collector) {
+  for (const child of Array.from(root.children)) {
+    if (child === targetNode) {
+      return true;
+    }
+
+    if (
+      child.matches?.(".moodle-hint-anchor") ||
+      child.matches?.(`#${STATUS_WIDGET_ID}`)
+    ) {
+      continue;
+    }
+
+    if (child.contains(targetNode)) {
+      collectTextBeforeNode(child, targetNode, collector);
+      return true;
+    }
+
+    // Other blanks (e.g. a sibling <li> in the same list) render as a
+    // neutral placeholder, not the [blank] marker reserved for the target.
+    const text = normalizeText(
+      renderNodeText(child, { blankToken: " ___ " })
+    );
+    if (text) {
+      collector.push(text);
+    }
+  }
+
+  return false;
+}
+
+function extractPromptContext(questionRoot, promptContainer) {
+  const formulation =
+    questionRoot.matches(".formulation")
+      ? questionRoot
+      : questionRoot.querySelector(".formulation");
+
+  if (!formulation || !promptContainer) {
+    return "";
+  }
+
+  const contextParts = [];
+  collectTextBeforeNode(formulation, promptContainer, contextParts);
+  return contextParts.join("\n");
+}
+
+function extractSubquestionOptions(subquestion) {
+  const select = subquestion.querySelector("select");
+  if (!select) {
+    return [];
+  }
+
+  return Array.from(select.options)
+    .filter((option) => {
+      const value = normalizeText(option.value);
+      return value && value !== "0";
+    })
+    .map((option) => normalizeText(option.textContent || option.innerText || ""))
+    .filter((optionText) => optionText && optionText !== "-");
+}
+
+function extractTextAroundSubquestion(promptContainer, subquestion) {
+  let before = "";
+  let after = "";
+  let foundTarget = false;
+
+  for (const childNode of Array.from(promptContainer.childNodes)) {
+    const isTargetNode =
+      childNode === subquestion ||
+      (childNode instanceof Element && childNode.contains(subquestion));
+
+    if (isTargetNode) {
+      foundTarget = true;
+      continue;
+    }
+
+    const text = renderNodeText(childNode);
+    if (!text) {
+      continue;
+    }
+
+    if (foundTarget) {
+      after += ` ${text}`;
+    } else {
+      before += ` ${text}`;
+    }
+  }
+
+  return {
+    before: normalizeText(before),
+    after: normalizeText(after),
+  };
+}
+
+function guessBlankVariableName(before) {
+  const normalized = normalizeText(before);
+
+  // Physics/formula style: "I1 = [blank] A" — pull out the "I1".
+  const equalsMatch = normalized.match(/([A-Za-z][A-Za-z0-9_]{0,6})\s*=\s*$/);
+  if (equalsMatch) {
+    return equalsMatch[1];
+  }
+
+  // Label style: "元素名1 : [blank]" / "...を表す単位の記号 : [blank]" — use
+  // the label text itself so the model gets a real anchor instead of a
+  // generic "Blank N"/"Symbol" name that can't distinguish repeated blanks.
+  // The label may span multiple sibling nodes (e.g. <strong>...</strong>
+  // followed by a plain text node), so allow internal spaces — just not
+  // another colon, which would pull in an unrelated earlier clause.
+  const colonMatch = normalized.match(/([^:：]{1,40})\s*[:：]\s*$/);
+  if (colonMatch) {
+    return normalizeText(colonMatch[1]);
+  }
+
+  return "";
+}
+
+function inferSubquestionFieldInfo(questionRoot, promptContainer, subquestion, index) {
+  const { before, after } = extractTextAroundSubquestion(promptContainer, subquestion);
+  // The instruction that determines symbol/katakana requirements (e.g.
+  // "カタカナで...答えよ") often sits in an earlier paragraph outside this
+  // blank's own <li>, not in its immediate before/after text — pull in the
+  // broader (correctly document-ordered) preceding context too.
+  const broaderContext = extractPromptContext(questionRoot, promptContainer);
+  const beforeCompact = `${broaderContext} ${before}`.toLowerCase().replace(/\s+/g, "");
+  const afterCompact = after.toLowerCase().replace(/\s+/g, "");
+  const variableName = guessBlankVariableName(before);
+
+  const symbolKeywords = [
+    /symbol/i,
+    /unit/i,
+    /\u8A18\u53F7/,
+    /\u5358\u4F4D/,
+  ];
+  const nameKeywords = [
+    /name/i,
+    /\u540D\u524D/,
+    /\u540D\u79F0/,
+    /\u30AB\u30BF\u30AB\u30CA/,
+  ];
+
+  const beforeHasSymbol = symbolKeywords.some((pattern) => pattern.test(beforeCompact));
+  const beforeHasName = nameKeywords.some((pattern) => pattern.test(beforeCompact));
+  const afterHasSymbol = symbolKeywords.some((pattern) => pattern.test(afterCompact));
+  const afterHasName = nameKeywords.some((pattern) => pattern.test(afterCompact));
+
+  if (beforeHasSymbol || afterHasSymbol) {
+    return { type: "symbol", label: "Symbol", variableName };
+  }
+
+  if (beforeHasName || afterHasName) {
+    return { type: "name", label: "Name", variableName };
+  }
+
+  return {
+    type: "blank",
+    label: `Blank ${index}`,
+    variableName,
+  };
+}
+
+function buildSubquestionText(questionRoot, promptContainer) {
+  const contextText = extractPromptContext(questionRoot, promptContainer);
+  const promptText = normalizeText(renderNodeText(promptContainer));
+
+  return [contextText, promptText].filter(Boolean).join("\n");
+}
+
+function getSubquestionLabel(questionRoot, promptText, index, fieldInfo) {
+  const matchedPromptLabel = promptText.match(/question\s*([0-9]+)/i);
+  const suffix = fieldInfo?.label ? ` ${fieldInfo.label}` : "";
+
+  if (matchedPromptLabel) {
+    return `Question ${matchedPromptLabel[1]}${suffix}`;
+  }
+
+  const baseLabel = getQuestionLabel(questionRoot);
+  return fieldInfo?.label
+    ? `${baseLabel} ${fieldInfo.label}`
+    : `${baseLabel} Blank ${index}`;
+}
+
+function extractSubquestions() {
+  const countsByRoot = new Map();
+  const blanksByRoot = new Map();
+
+  const blanks = Array.from(document.querySelectorAll(SUBQUESTION_SELECTOR))
+    .map((subquestion) => {
+      const questionRoot = getOwningQuestionRoot(subquestion);
+      if (!questionRoot) {
+        return null;
+      }
+
+      const nextIndex = (countsByRoot.get(questionRoot) || 0) + 1;
+      countsByRoot.set(questionRoot, nextIndex);
+
+      const promptContainer = getPromptContainer(subquestion);
+      const fieldInfo = inferSubquestionFieldInfo(
+        questionRoot,
+        promptContainer,
+        subquestion,
+        nextIndex
+      );
+      const questionText = buildSubquestionText(questionRoot, promptContainer);
+      if (!questionText) {
+        return null;
+      }
+
+      const inputElement = subquestion.querySelector(
+        "input:not([type='hidden']), textarea, select"
+      );
+      const uniqueId =
+        inputElement?.id ||
+        inputElement?.name ||
+        `${getQuestionLabel(questionRoot)}-${nextIndex}`;
+      const options = extractSubquestionOptions(subquestion);
+
+      const blank = {
+        key: buildQuestionKey(questionText, options, uniqueId),
+        label: getSubquestionLabel(
+          questionRoot,
+          questionText,
+          nextIndex,
+          fieldInfo
+        ),
+        questionRoot,
+        questionText,
+        options,
+        anchorElement: promptContainer,
+        targetType: fieldInfo.type,
+        fieldLabel: fieldInfo.label,
+        requestKey: uniqueId,
+        uniqueId,
+        inputElement,
+        variableName: fieldInfo.variableName || "",
+        hasExistingAnswer: isFormControlFilled(inputElement),
+      };
+
+      const siblingList = blanksByRoot.get(questionRoot) || [];
+      siblingList.push(blank);
+      blanksByRoot.set(questionRoot, siblingList);
+
+      return blank;
+    })
+    .filter(Boolean);
+
+  // When a question root has several related free-text blanks (e.g. a
+  // multi-part physics problem with I, I1, I2, V3...), solve them jointly in
+  // one request instead of one isolated request per blank. Isolated requests
+  // can't stay consistent with each other (e.g. re-deriving a different
+  // circuit topology for each current, or forgetting a later part builds on
+  // an earlier one).
+  for (const [questionRoot, group] of blanksByRoot) {
+    if (group.length < 2 || group.some((blank) => blank.options.length)) {
+      // Groups with dropdown options (e.g. matching-type subquestions) keep
+      // using the existing independent per-blank flow.
+      continue;
+    }
+
+    const formulation = questionRoot.matches(".formulation")
+      ? questionRoot
+      : questionRoot.querySelector(".formulation");
+    if (!formulation) {
+      continue;
+    }
+
+    const markedText = buildMultiBlankMarkedText(formulation);
+    if (!markedText) {
+      continue;
+    }
+
+    // Prefer a real anchor like "I1" over a generic "Blank 2" so the model
+    // has an explicit index-to-quantity mapping, not just the passage text.
+    const nameCounts = new Map();
+    for (const blank of group) {
+      const name = blank.variableName || blank.label;
+      nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+    }
+    const nameOccurrence = new Map();
+    const groupBlanks = group.map((blank) => {
+      const baseName = blank.variableName || blank.label;
+      let label = baseName;
+      if (nameCounts.get(baseName) > 1) {
+        // Disambiguate repeated names (e.g. "I" asked again in a later part).
+        const occurrence = (nameOccurrence.get(baseName) || 0) + 1;
+        nameOccurrence.set(baseName, occurrence);
+        label = `${baseName} (occurrence ${occurrence} of ${nameCounts.get(baseName)})`;
+      }
+      return { label, fieldType: blank.targetType };
+    });
+    const groupRequestKey = `${group[0].uniqueId}-group`;
+    // These are solved together in one request, so if any sibling already
+    // has an answer, treat the whole group as already attempted.
+    const groupHasExistingAnswer = group.some((blank) => blank.hasExistingAnswer);
+
+    group.forEach((blank, index) => {
+      blank.groupMarkedText = markedText;
+      blank.groupIndex = index;
+      blank.groupBlanks = groupBlanks;
+      blank.groupRequestKey = groupRequestKey;
+      blank.hasExistingAnswer = groupHasExistingAnswer;
+    });
+  }
+
+  return blanks;
+}
+
+function getImageContainer(questionRoot) {
+  if (isLinguaportaQuestionRoot(questionRoot)) {
+    return questionRoot.querySelector("#question_area") || questionRoot;
+  }
+
+  return (
+    questionRoot.querySelector(".qtext") ||
+    (questionRoot.matches(".formulation")
+      ? questionRoot
+      : questionRoot.querySelector(".formulation")) ||
+    questionRoot
+  );
+}
+
+function collectQuestionImageElements(container) {
+  if (!container) {
+    return [];
+  }
+
+  return Array.from(container.querySelectorAll("img")).filter((img) => {
+    if (
+      img.closest(`.${HINT_PANEL_CLASS}`) ||
+      img.closest(".moodle-hint-anchor") ||
+      img.closest(`#${STATUS_WIDGET_ID}`)
+    ) {
+      return false;
+    }
+
+    // Skip tiny decorations (icons, emoticons) once dimensions are known.
+    if (
+      img.complete &&
+      img.naturalWidth > 0 &&
+      (img.naturalWidth < 32 || img.naturalHeight < 32)
+    ) {
+      return false;
+    }
+
+    return Boolean(img.currentSrc || img.src);
+  });
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () =>
+      reject(reader.error || new Error("Failed to read media blob."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fetchImageAsDataUrl(url) {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image (${response.status}): ${url}`);
+  }
+
+  const blob = await response.blob();
+  if (blob.size > MAX_IMAGE_BYTES) {
+    throw new Error(`Image too large to send: ${url}`);
+  }
+
+  return blobToDataUrl(blob);
+}
+
+function getImageDataUrl(url) {
+  // Cache promises so concurrent scans share one fetch; drop failures so the
+  // next scan can retry.
+  let promise = imageDataUrlCache.get(url);
+  if (!promise) {
+    promise = fetchImageAsDataUrl(url).catch((error) => {
+      imageDataUrlCache.delete(url);
+      throw error;
+    });
+    imageDataUrlCache.set(url, promise);
+  }
+
+  return promise;
+}
+
+async function extractQuestionImages(container) {
+  const imgElements = collectQuestionImageElements(container).slice(
+    0,
+    MAX_IMAGES_PER_QUESTION
+  );
+
+  const images = [];
+  for (const img of imgElements) {
+    const url = img.currentSrc || img.src;
+    if (!url) {
+      continue;
+    }
+
+    try {
+      const dataUrl = await getImageDataUrl(url);
+      images.push({ url, dataUrl });
+    } catch (error) {
+      console.warn("Failed to load question image:", url, error);
+    }
+  }
+
+  return images;
+}
+
+function collectQuestionAudioUrls(questionRoot) {
+  if (!questionRoot) {
+    return [];
+  }
+
+  const selector = isLinguaportaQuestionRoot(questionRoot)
+    ? "audio#sound[src], audio#sound source[src]"
+    : "audio[src], audio source[src]";
+  const urls = Array.from(
+    questionRoot.querySelectorAll(selector)
+  )
+    .map((mediaElement) => {
+      const rawUrl =
+        mediaElement.currentSrc ||
+        mediaElement.src ||
+        mediaElement.getAttribute("src") ||
+        "";
+      if (!rawUrl) {
+        return "";
+      }
+      try {
+        return new URL(rawUrl, window.location.href).href;
+      } catch (_error) {
+        return "";
+      }
+    })
+    .filter(Boolean);
+
+  return Array.from(new Set(urls)).slice(0, MAX_AUDIO_FILES_PER_QUESTION);
+}
+
+async function fetchAudioAsDataUrl(url) {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch audio (${response.status}): ${url}`);
+  }
+
+  let blob = await response.blob();
+  if (blob.size > MAX_AUDIO_BYTES) {
+    throw new Error(`Audio too large to send: ${url}`);
+  }
+
+  if (!blob.type.startsWith("audio/")) {
+    const extension = new URL(url, window.location.href).pathname
+      .split(".")
+      .pop()
+      ?.toLowerCase();
+    const mimeType =
+      extension === "wav"
+        ? "audio/wav"
+        : extension === "ogg"
+          ? "audio/ogg"
+          : extension === "m4a"
+            ? "audio/m4a"
+            : "audio/mpeg";
+    blob = new Blob([blob], { type: mimeType });
+  }
+
+  return blobToDataUrl(blob);
+}
+
+function getAudioDataUrl(url) {
+  let promise = audioDataUrlCache.get(url);
+  if (!promise) {
+    promise = fetchAudioAsDataUrl(url).catch((error) => {
+      audioDataUrlCache.delete(url);
+      throw error;
+    });
+    audioDataUrlCache.set(url, promise);
+  }
+
+  return promise;
+}
+
+async function extractQuestionAudios(audioUrls) {
+  const audios = [];
+
+  for (const url of audioUrls) {
+    try {
+      const dataUrl = await getAudioDataUrl(url);
+      audios.push({ url, dataUrl });
+    } catch (error) {
+      console.warn("Failed to load question audio:", url, error);
+    }
+  }
+
+  return audios;
+}
+
+async function attachQuestionImages(questions) {
+  await Promise.all(
+    questions.map(async (question) => {
+      const container = getImageContainer(question.questionRoot);
+      question.audioSourceUrls = collectQuestionAudioUrls(question.questionRoot);
+      [question.images, question.audios] = await Promise.all([
+        extractQuestionImages(container),
+        extractQuestionAudios(question.audioSourceUrls),
+      ]);
+      const imageUrls = question.images.map((image) => image.url);
+      const audioUrls = question.audioSourceUrls;
+
+      if (question.targetType === "gapfill") {
+        question.key =
+          buildQuestionKey(
+            question.questionText,
+            [],
+            question.uniqueId || "",
+            imageUrls,
+            audioUrls
+          ) + "#gapfill";
+        return;
+      }
+
+      question.key = buildQuestionKey(
+        question.questionText,
+        question.options,
+        question.uniqueId || "",
+        imageUrls,
+        audioUrls
+      );
+    })
+  );
+
+  return questions;
+}
+
+// Inline dropdowns (Moodle "gapselect") live directly inside .qtext, not inside
+// a .subquestion wrapper. Each <select> is one blank sharing the same sentence.
+function getInlineSelects(container) {
+  if (!container) {
+    return [];
+  }
+
+  return Array.from(container.querySelectorAll("select")).filter(
+    (select) =>
+      Boolean(select.closest(".qtext")) &&
+      !select.closest(SUBQUESTION_SELECTOR)
+  );
+}
+
+function extractSelectOptions(select) {
+  return Array.from(select.options)
+    .filter((option) => {
+      const value = normalizeText(option.value);
+      return value && value !== "0";
+    })
+    .map((option) => normalizeText(option.textContent || option.innerText || ""))
+    .filter((optionText) => optionText && optionText !== "-");
+}
+
+function extractOrderingOptions(questionRoot) {
+  const linguaportaOptions = extractLinguaportaOrderingOptions(questionRoot);
+  if (linguaportaOptions.length) {
+    return linguaportaOptions;
+  }
+
+  return Array.from(questionRoot.querySelectorAll(ORDERING_ITEM_SELECTOR))
+    .map((item) => normalizeText(renderNodeText(item)))
+    .filter(Boolean);
+}
+
+function getMatchingRows(questionRoot) {
+  if (!questionRoot.matches(".match, .randomsamatch")) {
+    return [];
+  }
+
+  return Array.from(questionRoot.querySelectorAll(MATCHING_ROW_SELECTOR))
+    .map((row) => ({
+      row,
+      stem: normalizeText(renderNodeText(row.querySelector("td.text"))),
+      select: row.querySelector("select"),
+    }))
+    .filter((item) => item.stem && item.select);
+}
+
+function buildMatchingMarkedText(questionRoot, rows) {
+  const questionText = extractQuestionText(questionRoot);
+  const stems = rows.map((item, index) => `[${index + 1}] ${item.stem}`);
+  return normalizeText([questionText, ...stems].filter(Boolean).join("\n"));
+}
+
+function getClassNumber(element, prefix) {
+  const className = Array.from(element?.classList || []).find((name) =>
+    new RegExp(`^${prefix}\\d+$`).test(name)
+  );
+  return className ? Number(className.slice(prefix.length)) : 0;
+}
+
+function getDdwtosDrops(questionRoot) {
+  if (!questionRoot.matches(".ddwtos")) {
+    return [];
+  }
+
+  return Array.from(questionRoot.querySelectorAll(DDWTOS_DROP_SELECTOR));
+}
+
+function getDdwtosOptions(questionRoot, drop) {
+  const group = getClassNumber(drop, "group");
+  if (!group) {
+    return [];
+  }
+
+  return Array.from(
+    questionRoot.querySelectorAll(`.answercontainer .draghome.group${group}`)
+  )
+    .map((choice) => normalizeText(renderNodeText(choice)))
+    .filter(Boolean);
+}
+
+function ddwtosHasExistingAnswer(questionRoot) {
+  return Array.from(questionRoot.querySelectorAll("input.placeinput")).some(
+    (input) => {
+      const value = normalizeText(input.value);
+      return Boolean(value && value !== "0");
+    }
+  );
+}
+
+// The whole sentence with every blank numbered [1], [2], ... so the model can
+// reason about all blanks together in a single request.
+function buildGapfillMarkedText(container) {
+  return normalizeText(
+    renderNodeText(container, { selectCounter: { value: 0 } })
+  );
+}
+
+// The whole passage with every free-text blank numbered [1], [2], ... in
+// document order, so a multi-part problem (e.g. several related physics
+// answers) can be solved jointly with shared, consistent reasoning instead
+// of re-deriving each value from scratch in an isolated request.
+function buildMultiBlankMarkedText(formulation) {
+  return normalizeText(
+    renderNodeText(formulation, { blankCounter: { value: 0 } })
+  );
+}
+
+function buildGapfillBlanks(selects) {
+  return selects.map((select, index) => ({
+    label: `空白${index + 1}`,
+    options: extractSelectOptions(select),
+  }));
+}
+
+async function extractQuestions() {
+  const gapfillQuestions = [];
+  const standardQuestions = [];
+
+  for (const questionRoot of getQuestionRoots()) {
+    // Description is an information-only Moodle question type with no
+    // response control. Sending it to an API produces a meaningless hint.
+    if (questionRoot.matches(".description")) {
+      continue;
+    }
+
+    if (questionRoot.querySelector(SUBQUESTION_SELECTOR)) {
+      continue;
+    }
+
+    const uniqueId = isLinguaportaQuestionRoot(questionRoot)
+      ? getLinguaportaQuestionId(questionRoot)
+      : questionRoot.id || "";
+    const container = getImageContainer(questionRoot);
+    const inlineSelects = getInlineSelects(container);
+
+    const matchingRows = getMatchingRows(questionRoot);
+    if (matchingRows.length) {
+      const baseText = extractQuestionText(questionRoot);
+      const matchingSelects = matchingRows.map((item) => item.select);
+      gapfillQuestions.push({
+        key: buildQuestionKey(baseText, [], uniqueId) + "#matching",
+        label: getQuestionLabel(questionRoot),
+        questionRoot,
+        questionText: baseText,
+        markedText: buildMatchingMarkedText(questionRoot, matchingRows),
+        options: [],
+        targetType: "gapfill",
+        requestKey: `${uniqueId || baseText}-matching`,
+        uniqueId,
+        blanks: matchingRows.map((item) => ({
+          label: item.stem,
+          options: extractSelectOptions(item.select),
+        })),
+        hasExistingAnswer: anyFormControlFilled(matchingSelects),
+        anchorElement:
+          questionRoot.querySelector(".formulation") ||
+          questionRoot.querySelector(".content") ||
+          questionRoot,
+      });
+      continue;
+    }
+
+    const ddwtosDrops = getDdwtosDrops(questionRoot);
+    if (ddwtosDrops.length) {
+      const baseText = extractQuestionText(questionRoot);
+      gapfillQuestions.push({
+        key: buildQuestionKey(baseText, [], uniqueId) + "#ddwtos",
+        label: getQuestionLabel(questionRoot),
+        questionRoot,
+        questionText: baseText,
+        markedText: buildMultiBlankMarkedText(container),
+        options: [],
+        targetType: "gapfill",
+        requestKey: `${uniqueId || baseText}-ddwtos`,
+        uniqueId,
+        blanks: ddwtosDrops.map((drop, index) => ({
+          label: `空白${index + 1}`,
+          options: getDdwtosOptions(questionRoot, drop),
+        })),
+        hasExistingAnswer: ddwtosHasExistingAnswer(questionRoot),
+        anchorElement:
+          questionRoot.querySelector(".formulation") ||
+          questionRoot.querySelector(".content") ||
+          questionRoot,
+      });
+      continue;
+    }
+
+    if (inlineSelects.length) {
+      const baseText = extractQuestionText(questionRoot);
+      gapfillQuestions.push({
+        key: buildQuestionKey(baseText, [], uniqueId) + "#gapfill",
+        label: getQuestionLabel(questionRoot),
+        questionRoot,
+        questionText: baseText,
+        markedText: buildGapfillMarkedText(container),
+        options: [],
+        targetType: "gapfill",
+        requestKey: uniqueId || baseText,
+        uniqueId,
+        blanks: buildGapfillBlanks(inlineSelects),
+        hasExistingAnswer: anyFormControlFilled(inlineSelects),
+        anchorElement:
+          questionRoot.querySelector(".formulation") ||
+          questionRoot.querySelector(".content") ||
+          questionRoot,
+      });
+      continue;
+    }
+
+    const questionText = extractQuestionText(questionRoot);
+    if (!questionText) {
+      continue;
+    }
+
+    const hasOrderingLayout = hasLinguaportaOrderingLayout(questionRoot);
+    const orderingOptions = extractOrderingOptions(questionRoot);
+    // select.js initializes CardStyle text about 300 ms after page load. Do
+    // not misclassify the question as a normal blank while those cards are
+    // still empty; their mutations schedule another scan below.
+    if (hasOrderingLayout && !orderingOptions.length) {
+      continue;
+    }
+    const choiceTargetType = getChoiceTargetType(questionRoot);
+    const options = orderingOptions.length
+      ? orderingOptions
+      : choiceTargetType
+        ? extractOptions(questionRoot)
+        : [];
+    const targetType = hasOrderingLayout || orderingOptions.length
+      ? "ordering"
+      : choiceTargetType === "multiple_choice"
+        ? "multiple_choice"
+        : questionRoot.matches(".numerical, .calculated, .calculatedsimple")
+          ? "number"
+          : "standard";
+    standardQuestions.push({
+      key: buildQuestionKey(questionText, options, uniqueId),
+      label: getQuestionLabel(questionRoot),
+      questionRoot,
+      questionText,
+      options,
+      targetType,
+      requestKey: uniqueId || questionText,
+      uniqueId,
+      hasExistingAnswer: answerRootHasExistingAnswer(questionRoot),
+      anchorElement:
+        (isLinguaportaQuestionRoot(questionRoot)
+          ? questionRoot.querySelector("#question_area")
+          : null) ||
+        questionRoot.querySelector(".formulation") ||
+        questionRoot.querySelector(".content") ||
+        questionRoot,
+    });
+  }
+
+  const subquestions = extractSubquestions();
+  const questions = [
+    ...standardQuestions,
+    ...gapfillQuestions,
+    ...subquestions,
+  ];
+  await attachQuestionImages(questions);
+  return questions;
+}
+
+function ensurePanel(question) {
+  const existing = Array.from(
+    document.querySelectorAll(`.${HINT_PANEL_CLASS}`)
+  ).find((panel) => panel.dataset.questionKey === question.key);
+  if (existing) {
+    return existing;
+  }
+
+  const anchor = document.createElement("div");
+  anchor.className = "moodle-hint-anchor";
+
+  const isAlreadyAnswered = Boolean(question.hasExistingAnswer);
+
+  const panel = document.createElement("aside");
+  panel.className = HINT_PANEL_CLASS;
+  panel.dataset.state = isAlreadyAnswered ? "manual" : "idle";
+  panel.dataset.questionKey = question.key;
+  panel.innerHTML = isAlreadyAnswered
+    ? `
+    <div class="moodle-hint-header">
+      <div class="moodle-hint-title">${question.label} Hint</div>
+      <div class="moodle-hint-status">Skipped</div>
+    </div>
+    <div class="moodle-hint-answer">Already answered — hint not generated.</div>
+    <div class="moodle-hint-reason"></div>
+    <div class="moodle-hint-meta"></div>
+    <div class="moodle-hint-actions">
+      <button class="moodle-hint-retry" type="button">Generate hint</button>
+    </div>
+  `
+    : `
+    <div class="moodle-hint-header">
+      <div class="moodle-hint-title">${question.label} Hint</div>
+      <div class="moodle-hint-status">Queued</div>
+    </div>
+    <div class="moodle-hint-answer">Waiting for turn...</div>
+    <div class="moodle-hint-reason"></div>
+    <div class="moodle-hint-meta"></div>
+    <div class="moodle-hint-actions">
+      <button class="moodle-hint-retry" type="button">Retry</button>
+    </div>
+  `;
+
+  anchor.appendChild(panel);
+
+  const anchorTarget =
+    question.anchorElement ||
+    question.questionRoot.querySelector(".formulation") ||
+    question.questionRoot.querySelector(".content") ||
+    question.questionRoot;
+
+  if (anchorTarget?.parentNode) {
+    anchorTarget.insertAdjacentElement("afterend", anchor);
+  } else if (question.questionRoot) {
+    question.questionRoot.appendChild(anchor);
+  }
+
+  const retryButton = panel.querySelector(".moodle-hint-retry");
+  if (retryButton) {
+    retryButton.addEventListener("click", () => {
+      retryHint(question, panel);
+    });
+  }
+
+  return panel;
+}
+
+function removePanel(panel) {
+  const anchor = panel.closest(".moodle-hint-anchor");
+  if (anchor) {
+    anchor.remove();
+    return;
+  }
+
+  panel.remove();
+}
+
+function cleanupPanels(questions) {
+  const validKeys = new Set(questions.map((question) => question.key));
+  const seenKeys = new Set();
+
+  for (const panel of Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`))) {
+    const key = panel.dataset.questionKey || "";
+    if (!validKeys.has(key) || seenKeys.has(key)) {
+      removePanel(panel);
+      continue;
+    }
+
+    seenKeys.add(key);
+  }
+}
+
+function updatePanel(panel, payload) {
+  panel.dataset.state = payload.state;
+  panel.querySelector(".moodle-hint-status").textContent = payload.status;
+  panel.querySelector(".moodle-hint-answer").textContent = payload.answer;
+  panel.querySelector(".moodle-hint-reason").textContent = payload.reason || "";
+  panel.querySelector(".moodle-hint-meta").textContent = payload.meta || "";
+
+  const retryButton = panel.querySelector(".moodle-hint-retry");
+  if (retryButton) {
+    retryButton.textContent = payload.state === "manual" ? "Generate hint" : "Retry";
+  }
+}
+
+function retryHint(question, panel) {
+  if (isLinguaportaCorrectResult(question.questionRoot)) {
+    removePanel(panel);
+    return;
+  }
+
+  const isFirstGeneration = panel.dataset.state === "manual";
+
+  loadSettings().then((settings) => {
+    if (isPaused(settings)) {
+      updatePanel(panel, {
+        state: "idle",
+        status: "Paused",
+        answer: getPausedMessage(settings) || "Paused.",
+        reason: "",
+        meta: "",
+      });
+      return;
+    }
+
+    delete panel.dataset.loadedKey;
+    delete panel.dataset.loadingKey;
+
+    const cacheKey = getRequestCacheKey(question, settings);
+    answerCache.delete(cacheKey);
+    pendingAnswers.delete(cacheKey);
+
+    updatePanel(panel, {
+      state: "loading",
+      status: isFirstGeneration ? "Loading..." : "Retrying...",
+      answer: isFirstGeneration ? "Generating hint..." : "Retrying hint...",
+      reason: "",
+      meta: "",
+    });
+
+    enqueue(() => hydratePanel(question, panel, { force: true }));
+  });
+}
+
+function clearQueuedTasks() {
+  taskQueue.length = 0;
+  runtimeState.queueCount = activeRequests;
+}
+
+function resetPanelLoadState({ clearLoaded = false } = {}) {
+  for (const panel of Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`))) {
+    delete panel.dataset.loadingKey;
+
+    if (clearLoaded) {
+      delete panel.dataset.loadedKey;
+    }
+  }
+}
+
+function markLoadingPanelsPaused(message) {
+  const pausedMessage = message || "Paused.";
+
+  for (const panel of Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`))) {
+    if (panel.dataset.state !== "loading") {
+      continue;
+    }
+
+    updatePanel(panel, {
+      state: "idle",
+      status: "Paused",
+      answer: pausedMessage,
+      reason: "",
+      meta: "",
+    });
+  }
+}
+
+function getPanelStats() {
+  const panels = Array.from(document.querySelectorAll(`.${HINT_PANEL_CLASS}`));
+
+  return panels.reduce(
+    (stats, panel) => {
+      const state = panel.dataset.state;
+
+      if (state === "ready") {
+        stats.readyCount += 1;
+      } else if (state === "error") {
+        stats.errorCount += 1;
+      } else if (state === "loading") {
+        stats.loadingCount += 1;
+      }
+
+      return stats;
+    },
+    { readyCount: 0, errorCount: 0, loadingCount: 0 }
+  );
+}
+
+function parseAnswerText(answerPayload) {
+  const answerText =
+    typeof answerPayload === "string"
+      ? answerPayload
+      : answerPayload?.answer || "";
+  const modelName = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.model || "" : ""
+  );
+  const providerName = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.provider || "" : ""
+  );
+  const audioMode = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.audioMode || "" : ""
+  );
+  const expression = normalizeText(
+    typeof answerPayload === "object" ? answerPayload?.expression || "" : ""
+  );
+
+  const answer = String(answerText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+
+  if (!answer) {
+    return {
+      answer: "No hint available.",
+      reason: "",
+      meta: "",
+    };
+  }
+
+  // Fallback events (a provider failing over to the next) are logged in the
+  // popup's Logs panel instead of cluttering every hint with them.
+  return {
+    answer,
+    reason: expression ? `式: ${expression}` : "",
+    model: modelName,
+    provider: providerName,
+    audioMode,
+    meta: [
+      providerName ? `Provider: ${providerName}` : "",
+      modelName ? `Model: ${modelName}` : "",
+      audioMode ? `Audio: ${audioMode}` : "",
+    ].filter(Boolean).join(" | "),
+  };
+}
+
+function requestAnswer(question) {
+  const cacheKey = getRequestCacheKey(question);
+
+  if (answerCache.has(cacheKey)) {
+    return Promise.resolve(answerCache.get(cacheKey));
+  }
+
+  if (pendingAnswers.has(cacheKey)) {
+    return pendingAnswers.get(cacheKey);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        action: "getAnswer",
+        question: question.questionText,
+        options: question.options,
+        images: (question.images || []).map((image) => image.dataUrl),
+        audios: (question.audios || []).map((audioFile) => audioFile.dataUrl),
+        audioUrls: question.audioSourceUrls || [],
+        requestKey: question.requestKey || question.key,
+        targetType: question.targetType || "standard",
+        fieldLabel: question.fieldLabel || "",
+        preferOpenAiSol: isLinguaportaIncorrectResult(question.questionRoot),
+        detailedMode: Boolean(currentSettings.detailedMode),
+        materialMode: Boolean(currentSettings.materialMode),
+        materialRevision: Number(currentSettings.materialRevision) || 0,
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        const responseError = normalizeText(response?.error || "");
+        if (responseError) {
+          reject(new Error(responseError));
+          return;
+        }
+
+        const answer = normalizeText(response?.answer || "");
+        if (!answer || /^error fetching answer\.?$/i.test(answer)) {
+          reject(new Error("No answer found."));
+          return;
+        }
+
+        const result = {
+          answer,
+          model: normalizeText(response?.model || ""),
+          provider: normalizeText(response?.provider || ""),
+          audioMode: normalizeText(response?.audioMode || ""),
+          expression: normalizeText(response?.expression || ""),
+          fallbackNote: normalizeText(response?.fallbackNote || ""),
+        };
+
+        answerCache.set(cacheKey, result);
+        resolve(result);
+      }
+    );
+  }).finally(() => {
+    pendingAnswers.delete(cacheKey);
+  });
+
+  pendingAnswers.set(cacheKey, promise);
+  return promise;
+}
+
+function enqueue(task) {
+  taskQueue.push(task);
+  setStatus("running", "Preparing hints...", {
+    queueCount: taskQueue.length + activeRequests,
+  });
+  runQueue();
+}
+
+function runQueue() {
+  if (isPaused(currentSettings)) {
+    return;
+  }
+
+  while (activeRequests < MAX_CONCURRENT_REQUESTS && taskQueue.length) {
+    const task = taskQueue.shift();
+    activeRequests += 1;
+
+    Promise.resolve()
+      .then(task)
+      .catch((error) => {
+        console.error("Hint task failed:", error);
+      })
+      .finally(() => {
+        activeRequests -= 1;
+        if (taskQueue.length + activeRequests > 0) {
+          if (isPaused(currentSettings)) {
+            setStatus("idle", getPausedMessage(currentSettings), {
+              queueCount: activeRequests,
+            });
+          } else {
+            setStatus("running", "Preparing hints...", {
+              queueCount: taskQueue.length + activeRequests,
+            });
+          }
+        }
+
+        if (
+          activeRequests === 0 &&
+          taskQueue.length === 0 &&
+          deferredScanRequested &&
+          !isPaused(currentSettings)
+        ) {
+          deferredScanRequested = false;
+          scheduleScan();
+        }
+
+        runQueue();
+      });
+  }
+}
+
+function requestGapfillAnswer(question) {
+  const cacheKey = getRequestCacheKey(question);
+
+  if (answerCache.has(cacheKey)) {
+    return Promise.resolve(answerCache.get(cacheKey));
+  }
+
+  if (pendingAnswers.has(cacheKey)) {
+    return pendingAnswers.get(cacheKey);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        action: "getAnswer",
+        question: question.markedText,
+        blanks: question.blanks.map((blank) => ({
+          label: blank.label,
+          options: blank.options,
+        })),
+        images: (question.images || []).map((image) => image.dataUrl),
+        audios: (question.audios || []).map((audioFile) => audioFile.dataUrl),
+        audioUrls: question.audioSourceUrls || [],
+        requestKey: question.requestKey || question.key,
+        targetType: "gapfill",
+        preferOpenAiSol: isLinguaportaIncorrectResult(question.questionRoot),
+        detailedMode: Boolean(currentSettings.detailedMode),
+        materialMode: Boolean(currentSettings.materialMode),
+        materialRevision: Number(currentSettings.materialRevision) || 0,
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        const responseError = normalizeText(response?.error || "");
+        if (responseError) {
+          reject(new Error(responseError));
+          return;
+        }
+
+        const answers = Array.isArray(response?.answers) ? response.answers : [];
+        if (!answers.length) {
+          reject(new Error("No answer found."));
+          return;
+        }
+
+        const result = {
+          answers,
+          model: normalizeText(response?.model || ""),
+          provider: normalizeText(response?.provider || ""),
+          audioMode: normalizeText(response?.audioMode || ""),
+          fallbackNote: normalizeText(response?.fallbackNote || ""),
+        };
+
+        answerCache.set(cacheKey, result);
+        resolve(result);
+      }
+    );
+  }).finally(() => {
+    pendingAnswers.delete(cacheKey);
+  });
+
+  pendingAnswers.set(cacheKey, promise);
+  return promise;
+}
+
+async function resolveGapfillAnswers(question) {
+  const result = await requestGapfillAnswer(question);
+  const lines = result.answers.map(
+    (item, index) =>
+      `${normalizeText(item?.label) || `空白${index + 1}`}: ${
+        normalizeText(item?.answer) || "(不明)"
+      }`
+  );
+
+  const model = normalizeText(result.model || "");
+  const provider = normalizeText(result.provider || "");
+  const audioMode = normalizeText(result.audioMode || "");
+  const meta = [
+    provider ? `Provider: ${provider}` : "",
+    model ? `Model: ${model}` : "",
+    audioMode ? `Audio: ${audioMode}` : "",
+  ].filter(Boolean).join(" | ");
+
+  return {
+    answer: lines.join("\n"),
+    reason: "",
+    model,
+    provider,
+    audioMode,
+    meta,
+  };
+}
+
+function getGroupRequestCacheKey(question, settings = currentSettings) {
+  return JSON.stringify({
+    groupKey: question.groupRequestKey || question.groupMarkedText,
+    markedText: question.groupMarkedText,
+    detailedMode: Boolean(settings.detailedMode),
+    materialMode: Boolean(settings.materialMode),
+    freeApiMode: Boolean(settings.freeApiMode),
+    materialRevision: Number(settings.materialRevision) || 0,
+    imageUrls: (question.images || []).map((image) => image.url),
+  });
+}
+
+function requestGroupBlankAnswers(question) {
+  const cacheKey = getGroupRequestCacheKey(question);
+
+  if (answerCache.has(cacheKey)) {
+    return Promise.resolve(answerCache.get(cacheKey));
+  }
+
+  if (pendingAnswers.has(cacheKey)) {
+    return pendingAnswers.get(cacheKey);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        action: "getAnswer",
+        question: question.groupMarkedText,
+        blanks: question.groupBlanks,
+        images: (question.images || []).map((image) => image.dataUrl),
+        audios: (question.audios || []).map((audioFile) => audioFile.dataUrl),
+        audioUrls: question.audioSourceUrls || [],
+        requestKey: question.groupRequestKey || question.requestKey || question.key,
+        targetType: "multiblank",
+        preferOpenAiSol: isLinguaportaIncorrectResult(question.questionRoot),
+        detailedMode: Boolean(currentSettings.detailedMode),
+        materialMode: Boolean(currentSettings.materialMode),
+        materialRevision: Number(currentSettings.materialRevision) || 0,
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+
+        const responseError = normalizeText(response?.error || "");
+        if (responseError) {
+          reject(new Error(responseError));
+          return;
+        }
+
+        const answers = Array.isArray(response?.answers) ? response.answers : [];
+        if (!answers.length) {
+          reject(new Error("No answer found."));
+          return;
+        }
+
+        const result = {
+          answers,
+          model: normalizeText(response?.model || ""),
+          provider: normalizeText(response?.provider || ""),
+          audioMode: normalizeText(response?.audioMode || ""),
+          fallbackNote: normalizeText(response?.fallbackNote || ""),
+        };
+
+        answerCache.set(cacheKey, result);
+        resolve(result);
+      }
+    );
+  }).finally(() => {
+    pendingAnswers.delete(cacheKey);
+  });
+
+  pendingAnswers.set(cacheKey, promise);
+  return promise;
+}
+
+async function resolveGroupBlankAnswer(question) {
+  const result = await requestGroupBlankAnswers(question);
+  const item = result.answers[question.groupIndex];
+  const answer = normalizeText(item?.answer || "");
+  if (!answer) {
+    throw new Error("No answer found for this blank.");
+  }
+
+  const expression = normalizeText(item?.expression || "");
+  const model = normalizeText(result.model || "");
+  const provider = normalizeText(result.provider || "");
+  const audioMode = normalizeText(result.audioMode || "");
+
+  return {
+    answer,
+    reason: expression ? `式: ${expression}` : "",
+    model,
+    provider,
+    audioMode,
+    meta: [
+      provider ? `Provider: ${provider}` : "",
+      model ? `Model: ${model}` : "",
+      audioMode ? `Audio: ${audioMode}` : "",
+    ].filter(Boolean).join(" | "),
+  };
+}
+
+async function hydratePanel(question, panel, options = {}) {
+  const force = Boolean(options.force);
+  const settings = await loadSettings();
+  const loadKey = getRequestCacheKey(question, settings);
+
+  if (isLinguaportaCorrectResult(question.questionRoot)) {
+    removePanel(panel);
+    return;
+  }
+
+  if (
+    !force &&
+    (panel.dataset.loadedKey === loadKey || panel.dataset.loadingKey === loadKey)
+  ) {
+    return;
+  }
+
+  if (isPaused(settings)) {
+    return;
+  }
+
+  try {
+    panel.dataset.loadingKey = loadKey;
+    setStatus("running", `${question.label}: generating hint...`, {
+      queueCount: taskQueue.length + activeRequests,
+    });
+    updatePanel(panel, {
+      state: "loading",
+      status: "Loading...",
+      answer: "Generating hint...",
+      reason: "",
+      meta: "",
+    });
+
+    let parsed;
+    if (question.blanks && question.blanks.length) {
+      parsed = await resolveGapfillAnswers(question);
+    } else if (question.groupMarkedText) {
+      parsed = await resolveGroupBlankAnswer(question);
+    } else {
+      parsed = parseAnswerText(await requestAnswer(question));
+    }
+
+    // A stop request can happen while the provider call is in flight. Ignore
+    // that late result so it cannot fill fields or press page buttons.
+    if (isPaused(currentSettings)) {
+      updatePanel(panel, {
+        state: "idle",
+        status: "Stopped",
+        answer: getPausedMessage(currentSettings),
+        reason: "",
+        meta: "",
+      });
+      return;
+    }
+
+    // A result page can replace the answer form while an API request is in
+    // flight. Never display or apply that late response after a correct mark.
+    if (isLinguaportaCorrectResult(question.questionRoot)) {
+      removePanel(panel);
+      return;
+    }
+
+    const appliedCount = applyLinguaportaAnswer(question, parsed.answer);
+    const autoSubmitScheduled =
+      appliedCount > 0 &&
+      (await scheduleLinguaportaAutoSubmit(question, {
+        provider: parsed.provider,
+        model: parsed.model,
+      }));
+    const selectionMeta = [
+      appliedCount
+        ? `Applied to ${appliedCount} answer field${appliedCount === 1 ? "" : "s"}.`
+        : "",
+      autoSubmitScheduled ? "Submit: automatic" : "",
+    ].filter(Boolean).join(" | ");
+
+    panel.dataset.loadedKey = loadKey;
+    runtimeState.readyCount += 1;
+    updatePanel(panel, {
+      state: "ready",
+      status: "Ready",
+      answer: parsed.answer,
+      reason: parsed.reason,
+      meta: [selectionMeta, parsed.meta].filter(Boolean).join(" | "),
+    });
+    if (!isPaused(currentSettings)) {
+      setStatus(
+        "running",
+        autoSubmitScheduled
+          ? `${question.label}: answer ready; submitting...`
+          : `${question.label}: hint ready`,
+        {
+          readyCount: runtimeState.readyCount,
+          queueCount: taskQueue.length + activeRequests,
+          provider: parsed.provider || "",
+          model: parsed.model || "",
+          audioMode: parsed.audioMode || "",
+        }
+      );
+    }
+  } catch (error) {
+    console.error("Failed to fetch answer:", error);
+    runtimeState.errorCount += 1;
+    updatePanel(panel, {
+      state: "error",
+      status: "Error",
+      answer: "Could not fetch hint.",
+      reason: normalizeText(error?.message || ""),
+      meta: "",
+    });
+    if (!isPaused(currentSettings)) {
+      setStatus("error", `${question.label}: failed to fetch hint`, {
+        errorCount: runtimeState.errorCount,
+        queueCount: taskQueue.length + activeRequests,
+      });
+    }
+  } finally {
+    delete panel.dataset.loadingKey;
+
+    if (activeRequests === 1 && taskQueue.length === 0) {
+      if (isPaused(currentSettings)) {
+        setStatus("idle", getPausedMessage(currentSettings), {
+          queueCount: 0,
+        });
+        return;
+      }
+
+      const nextPhase = runtimeState.readyCount > 0 ? "ready" : "idle";
+      const nextMessage =
+        runtimeState.readyCount > 0
+          ? `Finished. ${runtimeState.readyCount} hint(s) ready.`
+          : "No hints prepared yet.";
+
+      setStatus(nextPhase, nextMessage, {
+        queueCount: 0,
+      });
+    }
+  }
+}
+
+async function processQuestions() {
+  ensureStyles();
+  ensureStatusWidget();
+  const settings = await loadSettings();
+
+  setStatus("scanning", "Scanning page for quiz prompts...", {
+    provider: "",
+    model: "",
+    audioMode: "",
+  });
+
+  if (isPaused(settings)) {
+    setStatus("idle", getPausedMessage(settings), {
+      queueCount: activeRequests,
+    });
+    return;
+  }
+
+  const linguaportaRoot = document.querySelector(LINGUAPORTA_QUESTION_SELECTOR);
+  if (isLinguaportaCorrectResult(linguaportaRoot)) {
+    deferredScanRequested = false;
+    clearQueuedTasks();
+    cleanupPanels([]);
+    runtimeState.questionCount = 0;
+    runtimeState.readyCount = 0;
+    runtimeState.errorCount = 0;
+    const isAdvancing = scheduleLinguaportaAutoAdvance(linguaportaRoot);
+    setStatus(
+      "idle",
+      isAdvancing
+        ? "Correct answer — moving to the next problem..."
+        : "Correct answer — no next problem button found.",
+      {
+      questionCount: 0,
+      readyCount: 0,
+      errorCount: 0,
+      queueCount: activeRequests,
+      }
+    );
+    return;
+  }
+
+  const questions = await extractQuestions();
+  cleanupPanels(questions);
+  runtimeState.questionCount = questions.length;
+
+  if (!questions.length) {
+    setStatus("idle", "No quiz prompts found on this page.", {
+      questionCount: 0,
+      readyCount: 0,
+      errorCount: 0,
+      queueCount: 0,
+    });
+    return;
+  }
+
+  const panelStats = getPanelStats();
+  runtimeState.readyCount = panelStats.readyCount;
+  runtimeState.errorCount = panelStats.errorCount;
+
+  setStatus("running", `Found ${questions.length} question(s). Starting...`, {
+    questionCount: questions.length,
+    readyCount: runtimeState.readyCount,
+    errorCount: runtimeState.errorCount,
+    queueCount: taskQueue.length + activeRequests,
+  });
+
+  let enqueuedCount = 0;
+
+  for (const question of questions) {
+    const panel = ensurePanel(question);
+
+    // Left as "manual" on creation because the field already had an answer;
+    // never auto-fetch it, only via its own "Generate hint" button.
+    if (panel.dataset.state === "manual") {
+      continue;
+    }
+
+    const loadKey = getRequestCacheKey(question, settings);
+
+    if (
+      panel.dataset.loadedKey === loadKey ||
+      panel.dataset.loadingKey === loadKey
+    ) {
+      continue;
+    }
+
+    enqueuedCount += 1;
+    enqueue(() => hydratePanel(question, panel));
+  }
+
+  if (!enqueuedCount && taskQueue.length + activeRequests === 0) {
+    const nextPhase =
+      runtimeState.errorCount > 0 && runtimeState.readyCount === 0
+        ? "error"
+        : runtimeState.readyCount > 0
+          ? "ready"
+          : "idle";
+
+    const nextMessage =
+      runtimeState.readyCount > 0
+        ? `Finished. ${runtimeState.readyCount} hint(s) ready.`
+        : runtimeState.errorCount > 0
+          ? "Hints failed to load."
+          : "Questions found, but no new work was needed.";
+
+    setStatus(nextPhase, nextMessage, {
+      queueCount: 0,
+    });
+  }
+}
+
+function scheduleScan() {
+  if (scanScheduled) {
+    return;
+  }
+
+  if (isPaused(currentSettings)) {
+    setStatus("idle", getPausedMessage(currentSettings), {
+      queueCount: activeRequests,
+    });
+    return;
+  }
+
+  if (activeRequests > 0 || taskQueue.length > 0) {
+    deferredScanRequested = true;
+    return;
+  }
+
+  scanScheduled = true;
+  window.setTimeout(() => {
+    scanScheduled = false;
+    processQuestions().catch((error) => {
+      console.error("Failed to process quiz hints:", error);
+      setStatus("error", "Failed to process quiz hints.", {
+        queueCount: taskQueue.length + activeRequests,
+      });
+    });
+  }, 250);
+}
+
+window.addEventListener("load", scheduleScan);
+document.addEventListener("readystatechange", scheduleScan);
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local") {
+    return;
+  }
+
+  const nextRawSettings = { ...currentSettings };
+  let hasRelevantChange = false;
+
+  for (const key of Object.keys(DEFAULT_SETTINGS)) {
+    if (!(key in changes)) {
+      continue;
+    }
+
+    nextRawSettings[key] = changes[key].newValue;
+    hasRelevantChange = true;
+  }
+
+  if (!hasRelevantChange) {
+    return;
+  }
+
+  const wasPaused = isPaused(currentSettings);
+  const nextSettings = normalizeSettings(nextRawSettings);
+  const detailedModeChanged =
+    nextSettings.detailedMode !== currentSettings.detailedMode;
+  const materialChanged =
+    nextSettings.materialMode !== currentSettings.materialMode ||
+    nextSettings.materialRevision !== currentSettings.materialRevision;
+  const apiModeChanged =
+    nextSettings.freeApiMode !== currentSettings.freeApiMode;
+  const availabilityChanged =
+    nextSettings.enabled !== currentSettings.enabled ||
+    nextSettings.pausedUntil !== currentSettings.pausedUntil;
+
+  currentSettings = nextSettings;
+  settingsLoaded = true;
+  syncStatusWidgetVisibility();
+
+  if (detailedModeChanged || materialChanged || apiModeChanged) {
+    answerCache.clear();
+    pendingAnswers.clear();
+    resetPanelLoadState({ clearLoaded: true });
+  }
+
+  if (isPaused(nextSettings)) {
+    if (!wasPaused) {
+      runtimeActionEpoch += 1;
+      autoAdvanceScheduledKey = "";
+      autoSubmittedButtons = new WeakSet();
+    }
+    deferredScanRequested = false;
+    clearQueuedTasks();
+    resetPanelLoadState();
+    markLoadingPanelsPaused(getPausedMessage(nextSettings));
+    setStatus("idle", getPausedMessage(nextSettings), {
+      queueCount: activeRequests,
+    });
+    return;
+  }
+
+  if (availabilityChanged || detailedModeChanged || materialChanged || apiModeChanged) {
+    scheduleScan();
+  }
+});
+
+const QUESTION_CONTENT_SELECTOR =
+  ".que, .qtext, .formulation, .subquestion, .answer, #problem-area, #question_area, #drill_form, #true_msg, #false_msg, .problem-next-group, .button-next-problem, .qu03_line, .DropLine, .CardStyle, audio, source, select, textarea";
+
+// Only a node that adds/removes real question content should trigger a rescan.
+// This ignores the quiz timer, autosave markers, tooltips, and our own panels,
+// which otherwise mutate constantly and cause the same question to be re-solved.
+function isQuestionRelevantNode(node) {
+  if (!(node instanceof Element)) {
+    return false;
+  }
+
+  if (
+    node.closest(".moodle-hint-anchor") ||
+    node.closest(`#${STATUS_WIDGET_ID}`)
+  ) {
+    return false;
+  }
+
+  return (
+    node.matches(QUESTION_CONTENT_SELECTOR) ||
+    Boolean(node.querySelector?.(QUESTION_CONTENT_SELECTOR))
+  );
+}
+
+const observer = new MutationObserver((mutations) => {
+  const shouldScan = mutations.some((mutation) => {
+    const mutationTarget =
+      mutation.target instanceof Element
+        ? mutation.target
+        : mutation.target.parentElement;
+
+    if (
+      mutationTarget &&
+      (mutationTarget.closest(".moodle-hint-anchor") ||
+        mutationTarget.closest(`#${STATUS_WIDGET_ID}`))
+    ) {
+      return false;
+    }
+
+    if (
+      mutationTarget?.closest(
+        "#true_msg, #false_msg, .CardStyle, .DropLine, audio"
+      )
+    ) {
+      return true;
+    }
+
+    return (
+      Array.from(mutation.addedNodes).some(isQuestionRelevantNode) ||
+      Array.from(mutation.removedNodes).some(isQuestionRelevantNode)
+    );
+  });
+
+  if (shouldScan) {
+    scheduleScan();
+  }
+});
+
+if (document.body) {
+  observer.observe(document.body, {
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+} else {
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      observer.observe(document.body, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      });
+      scheduleScan();
+    },
+    { once: true }
+  );
+}
+
+scheduleScan();

@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LinguaportaFuck Settings</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f8fafc;
+        --card: #ffffff;
+        --text: #0f172a;
+        --muted: #64748b;
+        --line: #e2e8f0;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --warn: #b45309;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-width: 340px;
+        background: linear-gradient(180deg, #ecfeff 0%, var(--bg) 100%);
+        color: var(--text);
+        font: 14px/1.5 "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+      }
+
+      main {
+        padding: 16px;
+      }
+
+      h1 {
+        margin: 0 0 6px;
+        font-size: 18px;
+      }
+
+      .subtitle {
+        margin: 0 0 14px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 14px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      }
+
+      .card + .card {
+        margin-top: 12px;
+      }
+
+      .label {
+        margin: 0 0 4px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .status {
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .status-note {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .toggle {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .toggle + .toggle {
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid var(--line);
+      }
+
+      .toggle-title {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .toggle-note {
+        margin: 2px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .switch {
+        position: relative;
+        width: 46px;
+        height: 28px;
+        flex: none;
+      }
+
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+
+      .slider {
+        position: absolute;
+        inset: 0;
+        background: #cbd5e1;
+        border-radius: 999px;
+        transition: background 0.18s ease;
+        cursor: pointer;
+      }
+
+      .slider::before {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        background: #ffffff;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.18);
+        transition: transform 0.18s ease;
+      }
+
+      .switch input:checked + .slider {
+        background: var(--accent);
+      }
+
+      .switch input:checked + .slider::before {
+        transform: translateX(18px);
+      }
+
+      .pause-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #ffffff;
+        color: var(--text);
+        padding: 9px 10px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button:hover {
+        border-color: #94a3b8;
+      }
+
+      .resume {
+        width: 100%;
+        margin-top: 10px;
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #ffffff;
+      }
+
+      .resume:hover {
+        background: var(--accent-strong);
+        border-color: var(--accent-strong);
+      }
+
+      .pause-note {
+        margin-top: 8px;
+        color: var(--warn);
+        font-size: 12px;
+        min-height: 18px;
+      }
+
+      .logs-toggle {
+        cursor: pointer;
+      }
+
+      .logs-chevron {
+        font-weight: 700;
+        color: var(--muted);
+        transition: transform 0.15s ease;
+      }
+
+      .logs-toggle[aria-expanded="true"] .logs-chevron {
+        transform: rotate(90deg);
+      }
+
+      .logs-panel {
+        margin-top: 10px;
+      }
+
+      .logs-list {
+        max-height: 220px;
+        overflow-y: auto;
+        display: grid;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .logs-empty {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .logs-entry {
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        font-size: 12px;
+        color: var(--text);
+        word-break: break-word;
+      }
+
+      .logs-entry-time {
+        color: var(--muted);
+        font-weight: 700;
+        margin-bottom: 2px;
+      }
+
+      .materials-controls {
+        display: grid;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .materials-controls input[type="file"] {
+        width: 100%;
+      }
+
+      .materials-text {
+        width: 100%;
+        min-height: 78px;
+        resize: vertical;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        font: inherit;
+        color: var(--text);
+        background: #fff;
+      }
+
+      .materials-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .materials-note {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .api-key-input {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        font: inherit;
+        color: var(--text);
+        background: #fff;
+      }
+
+      .api-key-note {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        min-height: 18px;
+        white-space: pre-wrap;
+      }
+
+      .provider-list {
+        display: grid;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .provider-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #ffffff;
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      .provider-item[data-enabled="true"] {
+        border-color: #99f6e4;
+        background: #ecfeff;
+      }
+
+      .provider-check {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .provider-check input {
+        width: 15px;
+        height: 15px;
+      }
+
+      .provider-rank {
+        min-width: 48px;
+        text-align: center;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--muted);
+      }
+
+      .provider-warning {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--warn);
+        white-space: nowrap;
+      }
+
+      .provider-warning:empty {
+        display: none;
+      }
+
+      .provider-move {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .provider-move-btn {
+        min-width: 46px;
+        padding: 4px 6px;
+        font-size: 12px;
+        font-weight: 700;
+        border-radius: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>LinguaportaFuck</h1>
+      <p class="subtitle">Control pause, display options, and material-priority mode.</p>
+
+      <section class="card">
+        <div class="label">Status</div>
+        <div class="status" id="statusText">Loading...</div>
+        <div class="status-note" id="statusNote"></div>
+      </section>
+
+      <section class="card">
+        <div class="label">API</div>
+        <div class="toggle-title">API Providers</div>
+        <div class="toggle-note">Checked providers are tried top to bottom. If one runs out of quota or balance, it automatically switches to the next.</div>
+        <div class="provider-list" id="providerList">
+          <div class="provider-item" data-provider-row data-provider="openai">
+            <label class="provider-check">
+              <input id="providerOpenAI" type="checkbox">
+              <span>OpenAI (Luna → Terra)</span>
+            </label>
+            <span class="provider-warning" data-provider-warning></span>
+            <span class="provider-rank" data-provider-rank>OFF</span>
+            <div class="provider-move">
+              <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="openai">Up</button>
+              <button type="button" class="provider-move-btn" data-provider-move="down" data-provider="openai">Down</button>
+            </div>
+          </div>
+          <div class="provider-item" data-provider-row data-provider="gemini">
+            <label class="provider-check">
+              <input id="providerGemini" type="checkbox">
+              <span>Gemini (AI Studio free tier)</span>
+            </label>
+            <span class="provider-warning" data-provider-warning></span>
+            <span class="provider-rank" data-provider-rank>OFF</span>
+            <div class="provider-move">
+              <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="gemini">Up</button>
+              <button type="button" class="provider-move-btn" data-provider-move="down" data-provider="gemini">Down</button>
+            </div>
+          </div>
+          <div class="provider-item" data-provider-row data-provider="openrouter">
+            <label class="provider-check">
+              <input id="providerOpenRouter" type="checkbox">
+              <span>OpenRouter (Gemini)</span>
+            </label>
+            <span class="provider-warning" data-provider-warning></span>
+            <span class="provider-rank" data-provider-rank>OFF</span>
+            <div class="provider-move">
+              <button type="button" class="provider-move-btn" data-provider-move="up" data-provider="openrouter">Up</button>
+              <button type="button" class="provider-move-btn" data-provider-move="down" data-provider="openrouter">Down</button>
+            </div>
+          </div>
+        </div>
+        <div class="toggle-note">Listening audio prefers Gemini when configured; if its quota is unavailable, OpenAI transcribes it and sends the transcript to Luna/Terra.</div>
+        <div class="toggle">
+          <div>
+            <p class="toggle-title">Free API Mode</p>
+            <p class="toggle-note">Try free OpenRouter models before paid Gemini models.</p>
+          </div>
+          <label class="switch">
+            <input id="freeApiModeToggle" type="checkbox">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="materials-controls">
+          <input
+            id="openaiApiKeyInput"
+            class="api-key-input"
+            type="password"
+            autocomplete="off"
+            placeholder="OpenAI API key (sk-...)"
+          >
+          <input
+            id="openrouterApiKeyInput"
+            class="api-key-input"
+            type="password"
+            autocomplete="off"
+            placeholder="OpenRouter API key"
+          >
+          <input
+            id="geminiApiKeyInput"
+            class="api-key-input"
+            type="password"
+            autocomplete="off"
+            placeholder="Gemini API key (Google AI Studio)"
+          >
+        </div>
+        <div class="materials-actions">
+          <button id="saveApiKeyButton" type="button">Save API Settings</button>
+          <button id="clearApiKeyButton" type="button">Clear API Keys</button>
+        </div>
+        <div class="api-key-note" id="apiKeyNote"></div>
+      </section>
+
+      <section class="card">
+        <div class="toggle">
+          <div>
+            <p class="toggle-title">Enable Extension</p>
+            <p class="toggle-note">Disable hint generation on the current page.</p>
+          </div>
+          <label class="switch">
+            <input id="enabledToggle" type="checkbox">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="toggle">
+          <div>
+            <p class="toggle-title">Detailed Mode</p>
+            <p class="toggle-note">Slower but can improve reasoning quality.</p>
+          </div>
+          <label class="switch">
+            <input id="detailedToggle" type="checkbox">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="toggle">
+          <div>
+            <p class="toggle-title">Show Status Widget</p>
+            <p class="toggle-note">Show the floating progress panel in the page.</p>
+          </div>
+          <label class="switch">
+            <input id="statusWidgetToggle" type="checkbox">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="toggle">
+          <div>
+            <p class="toggle-title">Material Priority Mode</p>
+            <p class="toggle-note">Prioritize uploaded reference material for answers.</p>
+          </div>
+          <label class="switch">
+            <input id="materialModeToggle" type="checkbox">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="materials-controls">
+          <input id="materialsInput" type="file" multiple accept=".pdf,.txt,.md,.csv,.json,.tsv,.html,.htm,.log,.rtf">
+          <textarea
+            id="materialsText"
+            class="materials-text"
+            placeholder="You can also paste reference text directly here."
+          ></textarea>
+        </div>
+
+        <div class="materials-actions">
+          <button id="importMaterialsButton" type="button">Apply Material</button>
+          <button id="clearMaterialsButton" type="button">Clear Material</button>
+        </div>
+
+        <div class="materials-note" id="materialsNote"></div>
+      </section>
+
+      <section class="card">
+        <div class="label">Pause</div>
+        <div class="toggle-title">Pause Hint Generation</div>
+        <div class="toggle-note">Stop hint generation for a selected duration.</div>
+        <div class="pause-grid">
+          <button data-pause-minutes="5" type="button">5m</button>
+          <button data-pause-minutes="15" type="button">15m</button>
+          <button data-pause-minutes="30" type="button">30m</button>
+          <button data-pause-minutes="60" type="button">60m</button>
+        </div>
+        <button class="resume" id="resumeButton" type="button">Resume Now</button>
+        <div class="pause-note" id="pauseNote"></div>
+      </section>
+
+      <section class="card">
+        <div class="toggle logs-toggle" id="logsToggleRow" role="button" tabindex="0" aria-expanded="false">
+          <div>
+            <p class="toggle-title">Logs</p>
+            <p class="toggle-note">Provider fallback events. Click to expand.</p>
+          </div>
+          <span class="logs-chevron" id="logsChevron">▸</span>
+        </div>
+        <div class="logs-panel" id="logsPanel" hidden>
+          <div class="logs-list" id="logsList"></div>
+          <div class="materials-actions">
+            <button id="clearLogsButton" type="button">Clear Logs</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

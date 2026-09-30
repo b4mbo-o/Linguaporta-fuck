@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "LinguaportaFuck",
+  "version": "1.0",
+  "description": "Linguaporta quiz helper using OpenAI, OpenRouter, and Gemini APIs.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://api.openai.com/*",
+    "https://openrouter.ai/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://*.linguaporta.jp/*",
+    "http://*.linguaporta.jp/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "LinguaportaFuck Settings"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/user/seibido/index.php*",
+        "https://*/user/seibido/index.php*",
+        "http://*/mod/quiz/attempt.php*",
+        "https://*/mod/quiz/attempt.php*"
+      ],
+      "js": ["content.js"]
+    }
+  ],
+  "icons": {
+    "48": "icon.png"
+  }
+}
