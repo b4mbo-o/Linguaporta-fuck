@@ -9,6 +9,11 @@ const MATCHING_ROW_SELECTOR = ".answer.table-reboot tr";
 const DDWTOS_DROP_SELECTOR = ".qtext .drop[class*='group']";
 const LINGUAPORTA_QUESTION_SELECTOR = "#problem-area";
 const LINGUAPORTA_ANSWER_SELECTOR = "#drill_form";
+// Listening exercises ("音声を聞いて…") ship an audio clip the learner is meant
+// to play; word/vocabulary problems ship a pronunciation MP3 that must not be
+// played. Matches background.js LISTENING_QUESTION_PATTERN.
+const LINGUAPORTA_LISTENING_PATTERN =
+  /(?:\u97F3\u58F0\s*\u3092\s*[\u805E\u8074]\u3044?\u3066|\u30EA\u30B9\u30CB\u30F3\u30B0|\b(?:listen|listening)\b)/i;
 const EDITABLE_TEXT_CONTROL_SELECTOR =
   "input:not([type]), input[type='text'], input[type='number'], textarea";
 const MAX_CONCURRENT_REQUESTS = 2;
@@ -47,6 +52,7 @@ let autoRevealedButtons = new WeakSet();
 let runtimeActionEpoch = 0;
 const retrySubmitReservations = new Set();
 const aiAttemptReservationChains = new Map();
+const playedListeningAudioKeys = new Set();
 
 const runtimeState = {
   phase: "booting",
@@ -1238,7 +1244,7 @@ function scheduleLinguaportaAutoAdvance(
     if (currentNextButton) {
       currentNextButton.click();
     }
-  }, 500);
+  }, Math.round(randomBetween(450, 950)));
 
   return true;
 }
@@ -1292,7 +1298,7 @@ function scheduleLinguaportaViewAnswer(questionRoot) {
       return;
     }
     viewAnswerButton.click();
-  }, 500);
+  }, Math.round(randomBetween(450, 950)));
   return true;
 }
 
@@ -1844,6 +1850,56 @@ function reserveRetryAutoSubmit(question) {
   });
 }
 
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// Estimates how long a human would take to read the prompt, work out the
+// answer and type/drag it before pressing 解答する. Harder-looking questions
+// (long prompts, more blanks, ordering, audio) get a longer, and never
+// constant, think time.
+function estimateHumanSubmitDelayMs(question, answerText) {
+  const questionText = normalizeText(
+    question?.groupMarkedText ||
+      question?.markedText ||
+      question?.questionText ||
+      ""
+  );
+  const answer = String(answerText || "");
+  const blanks = Array.isArray(question?.blanks)
+    ? question.blanks.length
+    : Array.isArray(question?.groupBlanks)
+      ? question.groupBlanks.length
+      : 0;
+  const optionCount = Array.isArray(question?.options)
+    ? question.options.length
+    : 0;
+  const isOrdering = question?.targetType === "ordering";
+  const hasAudio = Boolean(
+    (Array.isArray(question?.audios) && question.audios.length) ||
+      (Array.isArray(question?.audioSourceUrls) &&
+        question.audioSourceUrls.length)
+  );
+
+  let delay = 900;
+  delay += Math.min(questionText.length, 400) * 12;
+  delay += Math.min(answer.length, 400) * 45;
+  delay += blanks * 350;
+  if (isOrdering) {
+    delay += optionCount * 350 + 800;
+  }
+  if (hasAudio) {
+    delay += 2500;
+  }
+  if (question?.hasExistingAnswer) {
+    delay += 400;
+  }
+
+  // Jitter so the gap before submission is never identical.
+  delay *= 1 + randomBetween(-0.22, 0.38);
+  return Math.round(Math.min(Math.max(delay, 700), 25000));
+}
+
 async function scheduleLinguaportaAutoSubmit(question, result = {}) {
   const questionRoot = question?.questionRoot;
   if (
@@ -1883,7 +1939,7 @@ async function scheduleLinguaportaAutoSubmit(question, result = {}) {
       return;
     }
     answerButton.click();
-  }, 500);
+  }, estimateHumanSubmitDelayMs(question, result.answer));
 
   return true;
 }
@@ -2681,7 +2737,20 @@ async function prepareOrderingAudioHint(question) {
 }
 
 async function fetchAudioAsDataUrl(url) {
-  const response = await fetch(url, { credentials: "include" });
+  // Match Linguaporta's native audio transport closely: same-origin cookies,
+  // an explicit byte-range request, and the browser's normal HTTP cache. The
+  // site answers these requests with 206 Partial Content (or 200 on servers
+  // that ignore Range), both of which contain the complete clip for bytes=0-.
+  const response = await fetch(url, {
+    method: "GET",
+    credentials: "include",
+    cache: "default",
+    redirect: "follow",
+    headers: {
+      Accept: "*/*",
+      Range: "bytes=0-",
+    },
+  });
   if (!response.ok) {
     throw new Error(`Failed to fetch audio (${response.status}): ${url}`);
   }
@@ -2738,11 +2807,59 @@ async function extractQuestionAudios(audioUrls) {
   return audios;
 }
 
+function isLinguaportaListeningQuestion(question) {
+  const text = normalizeText(
+    question?.groupMarkedText ||
+      question?.markedText ||
+      question?.questionText ||
+      ""
+  );
+  return LINGUAPORTA_LISTENING_PATTERN.test(text);
+}
+
+function findLinguaportaPlayButton(questionRoot) {
+  const scope =
+    (questionRoot && questionRoot.closest && questionRoot.closest("form")) ||
+    document.querySelector("form[name=ExpForm]") ||
+    document;
+  return scope.querySelector("a.play_button, .play_button") || null;
+}
+
+// Start the clip as soon as a listening question is recognized so playback
+// happens before the answer is filled in, like a learner listening first.
+function playLinguaportaListeningAudio(question) {
+  if (!isLinguaportaListeningQuestion(question)) {
+    return false;
+  }
+  const key =
+    question?.key ||
+    question?.uniqueId ||
+    normalizeText(question?.questionText) ||
+    "listening";
+  if (playedListeningAudioKeys.has(key)) {
+    return false;
+  }
+  const playButton = findLinguaportaPlayButton(question?.questionRoot);
+  if (!playButton) {
+    return false;
+  }
+  playedListeningAudioKeys.add(key);
+  try {
+    playButton.click();
+  } catch (_error) {
+    // ignore autoplay/policy failures
+  }
+  return true;
+}
+
 async function attachQuestionImages(questions) {
   await Promise.all(
     questions.map(async (question) => {
       const container = getImageContainer(question.questionRoot);
       question.audioSourceUrls = collectQuestionAudioUrls(question.questionRoot);
+      if (question.audioSourceUrls.length) {
+        playLinguaportaListeningAudio(question);
+      }
       [question.images, question.audios] = await Promise.all([
         extractQuestionImages(container),
         extractQuestionAudios(question.audioSourceUrls),
@@ -3751,6 +3868,7 @@ async function hydratePanel(question, panel, options = {}) {
       (await scheduleLinguaportaAutoSubmit(question, {
         provider: parsed.provider,
         model: parsed.model,
+        answer: parsed.answer,
       }));
     if (autoSubmitScheduled) {
       rememberPendingCorrectAnswer(question, parsed.answer);

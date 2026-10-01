@@ -188,6 +188,15 @@ function compactText(value) {
     .replace(/[\s"'`.,!?;:()[\]{}<>/\\|_~-]+/g, "");
 }
 
+// Like compactText but keeps internal word spacing. Used when deciding whether
+// an answer was already rejected: the site distinguishes "any time" from
+// "anytime", so the guard must not treat spacing variants as duplicates.
+function normalizeAnswerForComparison(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+}
+
 function containsJapanese(text) {
   return /[\u3040-\u30ff\u3400-\u9fff]/.test(text);
 }
@@ -279,6 +288,12 @@ async function fetchRemoteAudioAsDataUrl(url) {
     const response = await fetch(url, {
       method: "GET",
       credentials: "include",
+      cache: "default",
+      redirect: "follow",
+      headers: {
+        Accept: "*/*",
+        Range: "bytes=0-",
+      },
       signal: controller?.signal,
     });
     if (!response.ok) {
@@ -2904,6 +2919,49 @@ function inferBlankAnswerFromTranscript(
     }
   }
 
+  // A blank at the very end ("... [blank] .") has no suffix token to bound
+  // the answer, so use every token after the matched prefix. Without this,
+  // local inference always failed for end-of-sentence blanks and the cloud
+  // model was asked instead, which could compress multi-word answers
+  // (e.g. "any time" -> "anytime") and get rejected by the site.
+  if (!bestMatch && !suffixTokens.length && prefixTokens.length) {
+    for (let prefixLength = maxPrefixLength; prefixLength >= 1; prefixLength -= 1) {
+      const prefix = prefixTokens.slice(-prefixLength);
+      let prefixIndex = findTokenSequence(transcriptTokens, prefix);
+      while (prefixIndex >= 0) {
+        const answerStart = prefixIndex + prefix.length;
+        const tokens = transcriptTokens.slice(answerStart, answerStart + 8);
+        if (tokens.length) {
+          const score = prefixLength * 20 - tokens.length;
+          if (!bestMatch || score > bestMatch.score) {
+            bestMatch = { score, tokens };
+          }
+        }
+        prefixIndex = findTokenSequence(transcriptTokens, prefix, prefixIndex + 1);
+      }
+    }
+  }
+
+  // Symmetric case: a blank at the very start ("[blank] ...").
+  if (!bestMatch && !prefixTokens.length && suffixTokens.length) {
+    for (let suffixLength = maxSuffixLength; suffixLength >= 1; suffixLength -= 1) {
+      const suffix = suffixTokens.slice(0, suffixLength);
+      const suffixIndex = findTokenSequence(transcriptTokens, suffix);
+      if (suffixIndex > 0) {
+        const tokens = transcriptTokens.slice(
+          Math.max(0, suffixIndex - 8),
+          suffixIndex
+        );
+        if (tokens.length) {
+          const score = suffixLength * 20 - tokens.length;
+          if (!bestMatch || score > bestMatch.score) {
+            bestMatch = { score, tokens };
+          }
+        }
+      }
+    }
+  }
+
   if (bestMatch?.tokens?.length) {
     return bestMatch.tokens.map((token) => token.raw).join(" ");
   }
@@ -2914,6 +2972,37 @@ function inferBlankAnswerFromTranscript(
     return transcriptTokens.map((token) => token.raw).join(" ");
   }
 
+  return "";
+}
+
+// When a model collapses or splits a multi-word listening answer, recover the
+// original spacing from the (authoritative) transcript: find a token span whose
+// compact form matches and return it with the transcript's own spacing.
+function buildTranscriptSpacingVariant(answer, transcript) {
+  const compactAnswer = compactText(answer);
+  if (!compactAnswer) {
+    return "";
+  }
+  const tokens = tokenizeSpokenEnglish(transcript || "");
+  for (let start = 0; start < tokens.length; start += 1) {
+    let compact = "";
+    for (let end = start; end < tokens.length && end - start < 8; end += 1) {
+      compact += tokens[end].key;
+      if (compact === compactAnswer) {
+        const raw = tokens
+          .slice(start, end + 1)
+          .map((token) => token.raw)
+          .join(" ");
+        if (raw !== answer) {
+          return raw;
+        }
+        break;
+      }
+      if (compact.length > compactAnswer.length) {
+        break;
+      }
+    }
+  }
   return "";
 }
 
@@ -2975,7 +3064,8 @@ async function callAiChat(
     : "";
   const rejectedLocalTranscriptAnswer = cleanedRejectedAnswers.some(
     (rejectedAnswer) =>
-      compactText(rejectedAnswer) === compactText(localTranscriptAnswer)
+      normalizeAnswerForComparison(rejectedAnswer) ===
+      normalizeAnswerForComparison(localTranscriptAnswer)
   );
   if (localTranscriptAnswer && !rejectedLocalTranscriptAnswer) {
     const result = {
@@ -3074,6 +3164,7 @@ async function callAiChat(
           "Previously marked incorrect by the learning site:",
           ...cleanedRejectedAnswers.map((answer) => `- ${answer}`),
           "Do not return any of those answers again. Reconsider the Japanese cue and choose a different exact textbook answer.",
+          "Word spacing matters to this site: the same words may be stored as one word or two (e.g. \"anytime\" vs \"any time\"). If your previous answer was rejected, try the alternative spacing of the same words.",
         ].join("\n");
       }
       let audioMode = "";
@@ -3129,18 +3220,34 @@ async function callAiChat(
         }
       );
       const rawAnswer = response.answer;
-      const sanitizedAnswer = sanitizeAnswer(
+      let finalAnswer = sanitizeAnswer(
         rawAnswer,
         cleanedQuestion,
         cleanedOptions,
         targetType
       );
-      const repeatedRejectedAnswer = cleanedRejectedAnswers.some(
-        (rejectedAnswer) =>
-          compactText(rejectedAnswer) === compactText(sanitizedAnswer)
-      );
 
-      if (repeatedRejectedAnswer) {
+      const wasRejected = (candidate) =>
+        cleanedRejectedAnswers.some(
+          (rejectedAnswer) =>
+            normalizeAnswerForComparison(rejectedAnswer) ===
+            normalizeAnswerForComparison(candidate)
+        );
+
+      // If the model returned an answer the site already marked wrong, try
+      // recovering the exact spacing from the authoritative audio transcript
+      // (e.g. the model wrote "anytime" but the clip said "any time").
+      if (wasRejected(finalAnswer) && localTranscript) {
+        const spacedVariant = buildTranscriptSpacingVariant(
+          finalAnswer,
+          localTranscript.text
+        );
+        if (spacedVariant && !wasRejected(spacedVariant)) {
+          finalAnswer = spacedVariant;
+        }
+      }
+
+      if (wasRejected(finalAnswer)) {
         lastInvalidAnswer = rawAnswer;
         lastFailureSummary = `repeated rejected answer "${extractFirstLine(rawAnswer)}"`;
         lastFailureProviderId = plan.providerId;
@@ -3154,7 +3261,7 @@ async function callAiChat(
 
       if (
         isLikelyInvalidAnswer(
-          sanitizedAnswer,
+          finalAnswer,
           cleanedQuestion,
           cleanedOptions,
           targetType
@@ -3172,7 +3279,7 @@ async function callAiChat(
       }
 
       const result = {
-        answer: sanitizedAnswer,
+        answer: finalAnswer,
         model: response.resolvedModel || plan.model,
         provider: plan.providerId,
         audioMode,
@@ -4081,7 +4188,23 @@ function injectLinguaportaContentScript(tabId) {
           reject(new Error(runtimeError.message));
           return;
         }
-        resolve();
+        // The report hook lives in the page's MAIN world, so it survives
+        // service-worker restarts and must be re-injected separately.
+        chrome.scripting.executeScript(
+          {
+            target: { tabId },
+            files: ["ffins-report.js"],
+            world: "MAIN",
+          },
+          () => {
+            const reportError = chrome.runtime.lastError;
+            if (reportError) {
+              reject(new Error(reportError.message));
+              return;
+            }
+            resolve();
+          }
+        );
       }
     );
   });

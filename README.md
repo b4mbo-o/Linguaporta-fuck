@@ -42,6 +42,7 @@ Linguaportaの `audio#sound` を音声問題として扱います。
 - popupの `Audio Transcription` で `Cloud API`、`Local Auto (GPU → CPU)`、`Local GPU (WebGPU)`、`Local CPU (WASM)` を選択可能
 - `Local Auto` はWebGPUが利用できればGPUを使い、初期化・推論に失敗した場合はCPUへ自動フォールバック
 - 「音声を聞いて」などと明記された音声空欄問題だけを文字起こしし、ローカル文字起こしと `[blank]` 前後を照合して答えを確定できた場合は回答用クラウドLLMを呼ばずに入力
+- LinguaportaのMP3はページと同じCookieを使い、ネイティブ音声取得と同様の `Range: bytes=0-` で取得（`200` / `206 Partial Content` に対応）
 - ローカルモードでは `Whisper tiny.en` をブラウザ内で実行し、MP3自体を回答Providerへ送らず文字起こし結果だけを渡す
 - モデルは初回利用時に取得してブラウザへキャッシュ（目安: GPU構成約120MB、CPU構成約41MB）
 - ローカル文字起こしが失敗した場合だけ、従来のクラウド音声経路へフォールバック
