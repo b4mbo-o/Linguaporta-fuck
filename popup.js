@@ -5,6 +5,7 @@ const DEFAULT_SETTINGS = {
   showStatusWidget: true,
   materialMode: false,
   freeApiMode: false,
+  audioTranscriptionMode: "auto",
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
@@ -63,6 +64,9 @@ const detailedToggle = document.getElementById("detailedToggle");
 const statusWidgetToggle = document.getElementById("statusWidgetToggle");
 const materialModeToggle = document.getElementById("materialModeToggle");
 const freeApiModeToggle = document.getElementById("freeApiModeToggle");
+const audioTranscriptionModeSelect = document.getElementById(
+  "audioTranscriptionModeSelect"
+);
 const materialsInput = document.getElementById("materialsInput");
 const materialsText = document.getElementById("materialsText");
 const importMaterialsButton = document.getElementById("importMaterialsButton");
@@ -149,6 +153,11 @@ function normalizeSettings(raw = {}) {
     showStatusWidget: raw.showStatusWidget !== false,
     materialMode: Boolean(raw.materialMode),
     freeApiMode: Boolean(raw.freeApiMode),
+    audioTranscriptionMode: ["cloud", "auto", "gpu", "cpu"].includes(
+      String(raw.audioTranscriptionMode || "").toLowerCase()
+    )
+      ? String(raw.audioTranscriptionMode).toLowerCase()
+      : DEFAULT_SETTINGS.audioTranscriptionMode,
     materialContext: typeof raw.materialContext === "string" ? raw.materialContext : "",
     materialSources,
     materialRevision: Number(raw.materialRevision) || 0,
@@ -574,6 +583,17 @@ function renderApiKeySummary(settings) {
       : "Custom LLM: not configured"
   );
   lines.push(`Free API mode: ${settings.freeApiMode ? "ON" : "OFF"}`);
+  const audioModeLabels = {
+    cloud: "Cloud API",
+    auto: "Local Auto (GPU -> CPU)",
+    gpu: "Local GPU (WebGPU)",
+    cpu: "Local CPU (WASM)",
+  };
+  lines.push(
+    `Audio transcription: ${
+      audioModeLabels[settings.audioTranscriptionMode] || audioModeLabels.cloud
+    }`
+  );
   apiKeyNote.textContent = lines.join("\n");
 }
 
@@ -584,6 +604,9 @@ function render(settings) {
   materialModeToggle.checked = settings.materialMode;
   if (freeApiModeToggle) {
     freeApiModeToggle.checked = settings.freeApiMode;
+  }
+  if (audioTranscriptionModeSelect) {
+    audioTranscriptionModeSelect.value = settings.audioTranscriptionMode;
   }
   providerOrderDraft = normalizeProviderOrder(settings.apiProviders);
   openaiApiKeyInput.value = settings.openaiApiKey || "";
@@ -744,6 +767,11 @@ async function saveProviderSettings(noteOnSuccess) {
   const customLlmEndpoint = String(customLlmEndpointInput.value || "").trim();
   const customLlmModel = String(customLlmModelInput.value || "").trim();
   const customLlmApiKey = String(customLlmApiKeyInput.value || "").trim();
+  const audioTranscriptionMode = ["cloud", "auto", "gpu", "cpu"].includes(
+    String(audioTranscriptionModeSelect?.value || "").toLowerCase()
+  )
+    ? String(audioTranscriptionModeSelect.value).toLowerCase()
+    : DEFAULT_SETTINGS.audioTranscriptionMode;
   let customLlmOriginPattern = "";
 
   if (
@@ -788,6 +816,7 @@ async function saveProviderSettings(noteOnSuccess) {
     customLlmEndpoint,
     customLlmModel,
     customLlmApiKey,
+    audioTranscriptionMode,
     providerRevision: Date.now(),
     apiKey: openaiApiKey,
   });
@@ -1016,6 +1045,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     "detailedMode",
     "showStatusWidget",
     "freeApiMode",
+    "audioTranscriptionMode",
     "materialMode",
     "materialContext",
     "materialSources",

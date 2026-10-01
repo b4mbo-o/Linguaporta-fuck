@@ -16,18 +16,21 @@ const MAX_IMAGES_PER_QUESTION = 4;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 const MAX_AUDIO_FILES_PER_QUESTION = 1;
 const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
-const RETRY_SUBMIT_GUARD_STORAGE_KEY = "linguaportaSolRetryGuards";
+const RETRY_SUBMIT_GUARD_STORAGE_KEY = "linguaportaRetrySubmitGuardsV2";
 const RETRY_SUBMIT_GUARD_TTL_MS = 30 * 60 * 1000;
-// V4 starts a fresh two-answer window now that every site-confirmed answer is
+// V4 starts a fresh answer window now that every site-confirmed answer is
 // learned; stale V3 counts must not block a later round of the same problem.
 const AI_ANSWER_ATTEMPTS_STORAGE_KEY = "linguaportaAiAnswerAttemptsV4";
 const AI_ANSWER_ATTEMPT_TTL_MS = 30 * 60 * 1000;
 const MAX_AI_ANSWERS_PER_QUESTION = 2;
+const MAX_ORDERING_AI_RETRIES = 3;
+const ORDERING_AUDIO_HINT_AFTER_FAILURES = 3;
 const AI_ANSWER_LIMIT_ERROR_CODE = "AI_ANSWER_LIMIT_REACHED";
 const LEARNED_ANSWERS_STORAGE_KEY = "linguaportaLearnedAnswersV1";
 const MAX_LEARNED_ANSWERS = 2000;
 const PENDING_CORRECT_ANSWER_SESSION_KEY = "linguaportaPendingCorrectAnswerV1";
 const PENDING_CORRECT_ANSWER_TTL_MS = 30 * 60 * 1000;
+const PENDING_CORRECT_ANSWER_CONFIRMATION_MS = 2 * 60 * 1000;
 
 const answerCache = new Map();
 const imageDataUrlCache = new Map();
@@ -1147,7 +1150,17 @@ function extractLinguaportaRevealedCorrectAnswer(questionRoot) {
     questionRoot.querySelectorAll(
       "#question_area .qu03 input[readonly], #question_area .qu03 textarea[readonly]"
     )
-  );
+  ).filter((control) => {
+    if (control.tagName === "TEXTAREA") {
+      return true;
+    }
+
+    // A few choice-result templates also render readonly radio/checkbox
+    // controls inside .qu03. They are not the free-text solution produced by
+    // "正解を見る" and must not replace the staged, confirmed AI choice.
+    const type = normalizeText(control.type || control.getAttribute("type"));
+    return !type || ["text", "number", "search", "email", "url", "tel"].includes(type);
+  });
   if (solutionControls.length !== 1) {
     return null;
   }
@@ -1293,7 +1306,13 @@ function hashStableQuestion(value) {
   return (hash >>> 0).toString(36);
 }
 
-function getAiAnswerFingerprint(question) {
+function createAiAnswerFingerprint(question, { stableOptionOrder = true } = {}) {
+  const normalizeOptions = (options) => {
+    const normalized = Array.isArray(options)
+      ? options.map((option) => normalizeText(option))
+      : [];
+    return stableOptionOrder ? normalized.sort() : normalized;
+  };
   const stableQuestion = JSON.stringify({
     questionText: normalizeText(
       question?.groupMarkedText ||
@@ -1301,15 +1320,13 @@ function getAiAnswerFingerprint(question) {
         question?.questionText ||
         ""
     ),
-    options: Array.isArray(question?.options)
-      ? question.options.map((option) => normalizeText(option))
-      : [],
+    // Choice and ordering cards can be shuffled between rounds. Their DOM
+    // order is not part of the question identity, so use the option multiset.
+    options: normalizeOptions(question?.options),
     blanks: Array.isArray(question?.blanks)
       ? question.blanks.map((blank) => ({
           label: normalizeText(blank?.label || ""),
-          options: Array.isArray(blank?.options)
-            ? blank.options.map((option) => normalizeText(option))
-            : [],
+          options: normalizeOptions(blank?.options),
         }))
       : Array.isArray(question?.groupBlanks)
         ? question.groupBlanks.map((blank) => ({
@@ -1320,6 +1337,14 @@ function getAiAnswerFingerprint(question) {
     targetType: normalizeText(question?.targetType || "standard"),
   });
   return hashStableQuestion(stableQuestion);
+}
+
+function getAiAnswerFingerprint(question) {
+  return createAiAnswerFingerprint(question);
+}
+
+function getLegacyAiAnswerFingerprint(question) {
+  return createAiAnswerFingerprint(question, { stableOptionOrder: false });
 }
 
 function getStoredObject(storageKey) {
@@ -1360,9 +1385,12 @@ async function saveLearnedCorrectAnswer(revealedAnswer) {
   }
 
   const fingerprint = getAiAnswerFingerprint(question);
+  const legacyFingerprint = getLegacyAiAnswerFingerprint(question);
   const learnedAnswers = await getStoredObject(LEARNED_ANSWERS_STORAGE_KEY);
-  const existingAnswer = normalizeText(learnedAnswers[fingerprint]?.answer);
-  if (existingAnswer === answer) {
+  const existingRecord =
+    learnedAnswers[fingerprint] || learnedAnswers[legacyFingerprint];
+  const existingAnswer = normalizeText(existingRecord?.answer);
+  if (existingAnswer === answer && learnedAnswers[fingerprint]) {
     return { answer, fingerprint, saved: false };
   }
 
@@ -1372,6 +1400,9 @@ async function saveLearnedCorrectAnswer(revealedAnswer) {
     targetType: normalizeText(question.targetType || "standard"),
     updatedAt: Date.now(),
   };
+  if (legacyFingerprint !== fingerprint) {
+    delete learnedAnswers[legacyFingerprint];
+  }
 
   const trimmedAnswers = Object.fromEntries(
     Object.entries(learnedAnswers)
@@ -1382,7 +1413,7 @@ async function saveLearnedCorrectAnswer(revealedAnswer) {
       .slice(0, MAX_LEARNED_ANSWERS)
   );
   await setStoredObject(LEARNED_ANSWERS_STORAGE_KEY, trimmedAnswers);
-  return { answer, fingerprint, saved: true };
+  return { answer, fingerprint, saved: existingAnswer !== answer };
 }
 
 function createLearnableQuestionSnapshot(question) {
@@ -1431,6 +1462,7 @@ function rememberPendingCorrectAnswer(question, answerText) {
         fingerprint: getAiAnswerFingerprint(questionSnapshot),
         promptIdentity: getLinguaportaPromptIdentity(question.questionRoot),
         questionId: getLinguaportaQuestionId(question.questionRoot),
+        pagePath: window.location.pathname,
         updatedAt: Date.now(),
       })
     );
@@ -1522,7 +1554,12 @@ async function promoteConfirmedCorrectAnswer(questionRoot) {
     pending.promptIdentity === currentPromptIdentity;
   const idMatches =
     Boolean(pending.questionId) && pending.questionId === currentQuestionId;
-  if (!promptMatches && !idMatches) {
+  const recentlySubmitted =
+    Date.now() - Number(pending.updatedAt || 0) <=
+    PENDING_CORRECT_ANSWER_CONFIRMATION_MS;
+  const pageMatches =
+    Boolean(pending.pagePath) && pending.pagePath === window.location.pathname;
+  if (!promptMatches && !idMatches && !(recentlySubmitted && pageMatches)) {
     clearPendingCorrectAnswer();
     return null;
   }
@@ -1540,11 +1577,13 @@ async function promoteConfirmedCorrectAnswer(questionRoot) {
 
 async function deleteLearnedCorrectAnswer(question) {
   const fingerprint = getAiAnswerFingerprint(question);
+  const legacyFingerprint = getLegacyAiAnswerFingerprint(question);
   const learnedAnswers = await getStoredObject(LEARNED_ANSWERS_STORAGE_KEY);
-  if (!(fingerprint in learnedAnswers)) {
+  if (!(fingerprint in learnedAnswers) && !(legacyFingerprint in learnedAnswers)) {
     return;
   }
   delete learnedAnswers[fingerprint];
+  delete learnedAnswers[legacyFingerprint];
   await setStoredObject(LEARNED_ANSWERS_STORAGE_KEY, learnedAnswers);
 }
 
@@ -1555,10 +1594,19 @@ async function loadLearnedCorrectAnswer(question) {
 
   try {
     const fingerprint = getAiAnswerFingerprint(question);
+    const legacyFingerprint = getLegacyAiAnswerFingerprint(question);
     const learnedAnswers = await getStoredObject(LEARNED_ANSWERS_STORAGE_KEY);
-    const answer = normalizeText(learnedAnswers[fingerprint]?.answer);
+    const learnedRecord =
+      learnedAnswers[fingerprint] || learnedAnswers[legacyFingerprint];
+    const answer = normalizeText(learnedRecord?.answer);
     if (!answer) {
       return "";
+    }
+
+    if (!learnedAnswers[fingerprint] && learnedRecord) {
+      learnedAnswers[fingerprint] = learnedRecord;
+      delete learnedAnswers[legacyFingerprint];
+      await setStoredObject(LEARNED_ANSWERS_STORAGE_KEY, learnedAnswers);
     }
 
     // If the site ever marks a stored answer wrong (for example after course
@@ -1584,11 +1632,23 @@ function getRetrySubmitFingerprint(question) {
   return getAiAnswerFingerprint(question);
 }
 
-function createAiAnswerLimitError() {
+function getMaxAiAnswersForQuestion(question) {
+  return question?.targetType === "ordering"
+    ? 1 + MAX_ORDERING_AI_RETRIES
+    : MAX_AI_ANSWERS_PER_QUESTION;
+}
+
+function getMaxRetrySubmitsForQuestion(question) {
+  return question?.targetType === "ordering" ? MAX_ORDERING_AI_RETRIES : 1;
+}
+
+function createAiAnswerLimitError(question) {
+  const maxAnswers = getMaxAiAnswersForQuestion(question);
   const error = new Error(
-    `AI回答は同じ問題につき${MAX_AI_ANSWERS_PER_QUESTION}回までです。`
+    `AI回答は同じ問題につき${maxAnswers}回までです。`
   );
   error.code = AI_ANSWER_LIMIT_ERROR_CODE;
+  error.maxAnswers = maxAnswers;
   return error;
 }
 
@@ -1628,14 +1688,14 @@ function reserveAiAnswerAttempt(question) {
                 0,
                 Number(attempts[fingerprint]?.count || 0)
               );
-              if (currentCount >= MAX_AI_ANSWERS_PER_QUESTION) {
-                reject(createAiAnswerLimitError());
+              if (currentCount >= getMaxAiAnswersForQuestion(question)) {
+                reject(createAiAnswerLimitError(question));
                 return;
               }
 
               // Persist the reservation before contacting the model. A form
               // submission can navigate immediately, so a reload must already
-              // know that this generation consumed one of the two attempts.
+              // know that this generation consumed one of its allowed attempts.
               attempts[fingerprint] = {
                 count: currentCount + 1,
                 updatedAt: now,
@@ -1745,20 +1805,29 @@ function reserveRetryAutoSubmit(question) {
           storedGuards && typeof storedGuards === "object" && !Array.isArray(storedGuards)
             ? { ...storedGuards }
             : {};
-        for (const [key, timestamp] of Object.entries(guards)) {
-          if (now - Number(timestamp) > RETRY_SUBMIT_GUARD_TTL_MS) {
+        for (const [key, entry] of Object.entries(guards)) {
+          const updatedAt = Number(entry?.updatedAt || 0);
+          if (!updatedAt || now - updatedAt > RETRY_SUBMIT_GUARD_TTL_MS) {
             delete guards[key];
           }
         }
 
-        if (Number(guards[fingerprint]) > 0) {
+        const currentCount = Math.max(
+          0,
+          Number(guards[fingerprint]?.count || 0)
+        );
+        if (currentCount >= getMaxRetrySubmitsForQuestion(question)) {
+          retrySubmitReservations.delete(fingerprint);
           resolve(false);
           return;
         }
 
         // Reserve before clicking. The form can navigate immediately, so the
-        // next page must already know this question consumed its one retry.
-        guards[fingerprint] = now;
+        // next page must already know how many retries have been submitted.
+        guards[fingerprint] = {
+          count: currentCount + 1,
+          updatedAt: now,
+        };
         chrome.storage.local.set(
           { [RETRY_SUBMIT_GUARD_STORAGE_KEY]: guards },
           () => {
@@ -2523,6 +2592,19 @@ function collectQuestionAudioUrls(questionRoot) {
   const urls = Array.from(
     questionRoot.querySelectorAll(selector)
   )
+    .filter((mediaElement) => {
+      const hintPanel = mediaElement.closest?.("#hint2");
+      if (!hintPanel) {
+        return true;
+      }
+
+      const inlineHidden =
+        hintPanel.hidden || hintPanel.style?.display === "none";
+      const computedHidden =
+        typeof window.getComputedStyle === "function" &&
+        window.getComputedStyle(hintPanel).display === "none";
+      return !inlineHidden && !computedHidden;
+    })
     .map((mediaElement) => {
       const rawUrl =
         mediaElement.currentSrc ||
@@ -2541,6 +2623,61 @@ function collectQuestionAudioUrls(questionRoot) {
     .filter(Boolean);
 
   return Array.from(new Set(urls)).slice(0, MAX_AUDIO_FILES_PER_QUESTION);
+}
+
+function findLinguaportaHintButton(questionRoot) {
+  if (!isLinguaportaQuestionRoot(questionRoot)) {
+    return null;
+  }
+
+  return Array.from(
+    questionRoot.querySelectorAll("#hint1 input[type='button'], #hint1 button")
+  ).find((button) => {
+    const label = normalizeText(button.value || button.textContent);
+    return !button.disabled && label === "ヒントを見る";
+  }) || null;
+}
+
+async function getAiAnswerAttemptCount(question) {
+  const fingerprint = getAiAnswerFingerprint(question);
+  try {
+    const attempts = await getStoredObject(AI_ANSWER_ATTEMPTS_STORAGE_KEY);
+    return Math.max(0, Number(attempts[fingerprint]?.count || 0));
+  } catch (error) {
+    console.warn("Failed to read the Linguaporta answer count:", error);
+    return 0;
+  }
+}
+
+async function prepareOrderingAudioHint(question) {
+  if (
+    question?.targetType !== "ordering" ||
+    !isLinguaportaIncorrectResult(question.questionRoot)
+  ) {
+    return false;
+  }
+
+  const attemptCount = await getAiAnswerAttemptCount(question);
+  if (attemptCount !== ORDERING_AUDIO_HINT_AFTER_FAILURES) {
+    return false;
+  }
+
+  const hintButton = findLinguaportaHintButton(question.questionRoot);
+  if (!hintButton) {
+    return false;
+  }
+
+  hintButton.click();
+  await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+  const audioUrls = collectQuestionAudioUrls(question.questionRoot);
+  if (!audioUrls.length) {
+    return false;
+  }
+
+  question.audioSourceUrls = audioUrls;
+  question.audios = await extractQuestionAudios(audioUrls);
+  return Boolean(question.audios.length || audioUrls.length);
 }
 
 async function fetchAudioAsDataUrl(url) {
@@ -2912,11 +3049,13 @@ function ensurePanel(question) {
     document.querySelectorAll(`.${HINT_PANEL_CLASS}`)
   ).find((panel) => panel.dataset.questionKey === question.key);
   if (existing) {
+    placeHintAnchor(question, existing.closest(".linguaporta-hint-anchor"));
     return existing;
   }
 
   const anchor = document.createElement("div");
   anchor.className = "linguaporta-hint-anchor";
+  anchor.dataset.layout = question.targetType === "ordering" ? "ordering" : "standard";
 
   const isAlreadyAnswered = Boolean(question.hasExistingAnswer);
 
@@ -2952,17 +3091,7 @@ function ensurePanel(question) {
 
   anchor.appendChild(panel);
 
-  const anchorTarget =
-    question.anchorElement ||
-    question.questionRoot.querySelector(".formulation") ||
-    question.questionRoot.querySelector(".content") ||
-    question.questionRoot;
-
-  if (anchorTarget?.parentNode) {
-    anchorTarget.insertAdjacentElement("afterend", anchor);
-  } else if (question.questionRoot) {
-    question.questionRoot.appendChild(anchor);
-  }
+  placeHintAnchor(question, anchor);
 
   const retryButton = panel.querySelector(".linguaporta-hint-retry");
   if (retryButton) {
@@ -2972,6 +3101,39 @@ function ensurePanel(question) {
   }
 
   return panel;
+}
+
+function placeHintAnchor(question, anchor) {
+  if (!anchor || !question?.questionRoot) {
+    return;
+  }
+
+  const isOrdering = question.targetType === "ordering";
+  anchor.dataset.layout = isOrdering ? "ordering" : "standard";
+
+  // CardStyle and DropLine use absolute coordinates and extend below the
+  // normal #question_area flow. Inserting the panel directly after that area
+  // makes the black line and cards paint across the panel. Put ordering hints
+  // after the complete answer form so they cannot affect or cover drag geometry.
+  if (isOrdering) {
+    const answerForm = question.questionRoot.querySelector("form[name='ExpForm']");
+    if (answerForm?.parentNode) {
+      answerForm.insertAdjacentElement("afterend", anchor);
+      return;
+    }
+  }
+
+  const anchorTarget =
+    question.anchorElement ||
+    question.questionRoot.querySelector(".formulation") ||
+    question.questionRoot.querySelector(".content") ||
+    question.questionRoot;
+
+  if (anchorTarget?.parentNode) {
+    anchorTarget.insertAdjacentElement("afterend", anchor);
+  } else {
+    question.questionRoot.appendChild(anchor);
+  }
 }
 
 function removePanel(panel) {
@@ -3507,21 +3669,27 @@ async function resolveGroupBlankAnswer(question) {
 async function hydratePanel(question, panel, options = {}) {
   const force = Boolean(options.force);
   const settings = await loadSettings();
-  const loadKey = getRequestCacheKey(question, settings);
 
   if (isLinguaportaCorrectResult(question.questionRoot)) {
     removePanel(panel);
     return;
   }
 
+  if (isPaused(settings)) {
+    return;
+  }
+
+  try {
+    await prepareOrderingAudioHint(question);
+  } catch (error) {
+    console.warn("Failed to prepare the ordering audio hint:", error);
+  }
+
+  const loadKey = getRequestCacheKey(question, settings);
   if (
     !force &&
     (panel.dataset.loadedKey === loadKey || panel.dataset.loadingKey === loadKey)
   ) {
-    return;
-  }
-
-  if (isPaused(settings)) {
     return;
   }
 
@@ -3578,15 +3746,15 @@ async function hydratePanel(question, panel, options = {}) {
     }
 
     const appliedCount = applyLinguaportaAnswer(question, parsed.answer);
-    if (appliedCount > 0) {
-      rememberPendingCorrectAnswer(question, parsed.answer);
-    }
     const autoSubmitScheduled =
       appliedCount > 0 &&
       (await scheduleLinguaportaAutoSubmit(question, {
         provider: parsed.provider,
         model: parsed.model,
       }));
+    if (autoSubmitScheduled) {
+      rememberPendingCorrectAnswer(question, parsed.answer);
+    }
     const selectionMeta = [
       appliedCount
         ? `Applied to ${appliedCount} answer field${appliedCount === 1 ? "" : "s"}.`
@@ -3622,15 +3790,21 @@ async function hydratePanel(question, panel, options = {}) {
     console.error("Failed to fetch answer:", error);
     const answerLimitReached = error?.code === AI_ANSWER_LIMIT_ERROR_CODE;
     if (answerLimitReached) {
+      const maxAnswers = Math.max(
+        1,
+        Number(error?.maxAnswers || getMaxAiAnswersForQuestion(question))
+      );
       const revealScheduled = scheduleLinguaportaViewAnswer(question.questionRoot);
       panel.dataset.loadedKey = loadKey;
       updatePanel(panel, {
         state: "limit",
         status: "Stopped",
-        answer: `この問題はAIで${MAX_AI_ANSWERS_PER_QUESTION}回答済みです。`,
+        answer: `この問題はAIで${maxAnswers}回答済みです。`,
         reason: revealScheduled
           ? "正解を表示して次回用に保存します。"
-          : "3回目以降のAPI送信と自動再回答を停止しました。",
+          : question.targetType === "ordering"
+            ? `並び替えのRetry上限（${MAX_ORDERING_AI_RETRIES}回）に達したため、自動再回答を停止しました。`
+            : "3回目以降のAPI送信と自動再回答を停止しました。",
         meta: "",
       });
       if (!isPaused(currentSettings)) {

@@ -281,6 +281,17 @@
         background: #fff;
       }
 
+      .settings-select {
+        width: 100%;
+        margin-top: 8px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+      }
+
       .api-key-note {
         margin-top: 8px;
         color: var(--muted);
@@ -424,6 +435,18 @@
           </div>
         </div>
         <div class="toggle-note">PlaMo is tried first for non-audio word questions. Incorrect retries switch to OpenAI; speech/audio Custom models can prioritize Gemini for listening.</div>
+        <div class="toggle" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);">
+          <div style="width: 100%;">
+            <p class="toggle-title">Audio Transcription</p>
+            <p class="toggle-note">Local modes run Whisper tiny.en in this browser. The first use downloads and caches the model.</p>
+            <select id="audioTranscriptionModeSelect" class="settings-select">
+              <option value="auto" selected>Local Auto (GPU → CPU)</option>
+              <option value="gpu">Local GPU (WebGPU)</option>
+              <option value="cpu">Local CPU (WASM)</option>
+              <option value="cloud">Cloud API</option>
+            </select>
+          </div>
+        </div>
         <div class="toggle">
           <div>
             <p class="toggle-title">Free API Mode</p>

@@ -1,13 +1,17 @@
 {
   "manifest_version": 3,
   "name": "LinguaportaFuck",
-  "version": "1.0.7",
-  "description": "Linguaporta exercise helper using OpenAI, OpenRouter, Gemini, and custom OpenAI-compatible LLM APIs.",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "version": "1.0.13",
+  "description": "Linguaporta exercise helper using local Whisper, OpenAI, OpenRouter, Gemini, and custom OpenAI-compatible LLM APIs.",
+  "permissions": ["activeTab", "scripting", "storage", "offscreen", "unlimitedStorage"],
   "host_permissions": [
     "https://api.openai.com/*",
     "https://openrouter.ai/*",
     "https://generativelanguage.googleapis.com/*",
+    "https://huggingface.co/*",
+    "https://*.huggingface.co/*",
+    "https://*.hf.co/*",
+    "https://*.xethub.hf.co/*",
     "https://*.linguaporta.jp/*",
     "http://*.linguaporta.jp/*"
   ],
@@ -21,6 +25,9 @@
   },
   "background": {
     "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https: http:; worker-src 'self'"
   },
   "content_scripts": [
     {

@@ -10,6 +10,8 @@ const OPENROUTER_KEY_ENDPOINT = "https://openrouter.ai/api/v1/key";
 const GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const OPENROUTER_APP_URL = "https://openrouter.ai";
 const OPENROUTER_APP_TITLE = "LinguaportaFuck";
+const LOCAL_TRANSCRIBER_DOCUMENT = "offscreen.html";
+const LOCAL_TRANSCRIPTION_TIMEOUT_MS = 3 * 60 * 1000;
 
 // Start with the fastest cost-sensitive GPT-5.6 model. If the request fails
 // or its answer is rejected by validation, the existing plan loop escalates
@@ -96,12 +98,15 @@ const CUSTOM_LLM_GEMINI_AUDIO_PRIORITY_PATTERN =
 const CUSTOM_LLM_PLAMO_PATTERN = /plamo/i;
 const WORD_QUESTION_PATTERN =
   /(?:\u5358\u8A9E|\u8A9E\u53E5|\u610F\u5473|\u65E5\u672C\u6587|\u82F1\u6587|\u82F1\u8A9E|\u548C\u8A33|\u7A7A\u6240|\u7A7A\u6B04|\u8A33|\[blank\]|\bword\b|\bphrase\b|\bmeaning\b|\btranslate\b|\bvocabulary\b)/i;
+const LISTENING_QUESTION_PATTERN =
+  /(?:\u97F3\u58F0\s*\u3092\s*[\u805E\u8074]\u3044?\u3066|\u30EA\u30B9\u30CB\u30F3\u30B0|\b(?:listen|listening)\b.{0,24}\b(?:audio|recording|voice)\b|\b(?:audio|recording|voice)\b.{0,24}\b(?:listen|listening)\b)/i;
 const MATERIAL_DEFAULTS = {
   materialMode: false,
   materialContext: "",
   materialSources: [],
   materialRevision: 0,
   freeApiMode: false,
+  audioTranscriptionMode: "auto",
   apiProviders: DEFAULT_PROVIDER_ORDER,
   openaiApiKey: "",
   openrouterApiKey: "",
@@ -148,6 +153,7 @@ const SHELL_COMMAND_ANSWER_PATTERN =
 
 const answerCache = new Map();
 const audioTranscriptionCache = new Map();
+const localAudioTranscriptionCache = new Map();
 const aiRequestQueue = [];
 const openRouterRuntimeState = {
   keyStatusExpiresAt: 0,
@@ -156,9 +162,15 @@ const openRouterRuntimeState = {
 let activeAiRequests = 0;
 let aiRequestRunnerScheduled = false;
 let lastAiRequestStartedAt = 0;
+let creatingLocalTranscriberDocument = null;
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeAudioTranscriptionMode(value) {
+  const mode = normalizeText(value).toLowerCase();
+  return ["cloud", "auto", "gpu", "cpu"].includes(mode) ? mode : "auto";
 }
 
 function normalizeMaterialContext(value) {
@@ -447,6 +459,104 @@ function getOpenAiAudioTranscript(dataUrl, credentials, question = "") {
     }
   );
   audioTranscriptionCache.set(cacheKey, transcription);
+  return transcription;
+}
+
+async function hasLocalTranscriberDocument() {
+  const documentUrl = chrome.runtime.getURL(LOCAL_TRANSCRIBER_DOCUMENT);
+  if (typeof chrome.runtime.getContexts === "function") {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [documentUrl],
+    });
+    return contexts.length > 0;
+  }
+
+  if (typeof clients !== "undefined" && typeof clients.matchAll === "function") {
+    const matchedClients = await clients.matchAll();
+    return matchedClients.some((client) => client.url === documentUrl);
+  }
+  return false;
+}
+
+async function ensureLocalTranscriberDocument() {
+  if (await hasLocalTranscriberDocument()) {
+    return;
+  }
+  if (!creatingLocalTranscriberDocument) {
+    creatingLocalTranscriberDocument = chrome.offscreen
+      .createDocument({
+        url: LOCAL_TRANSCRIBER_DOCUMENT,
+        reasons: ["WORKERS", "BLOBS"],
+        justification: "Run local Whisper speech recognition for Linguaporta audio.",
+      })
+      .finally(() => {
+        creatingLocalTranscriberDocument = null;
+      });
+  }
+  await creatingLocalTranscriberDocument;
+}
+
+function requestLocalAudioTranscript(dataUrl, mode) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      await ensureLocalTranscriberDocument();
+    } catch (error) {
+      reject(new Error(`Could not start local Whisper: ${error?.message || error}`));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      reject(
+        new Error(
+          `Local Whisper timed out after ${Math.round(
+            LOCAL_TRANSCRIPTION_TIMEOUT_MS / 1000
+          )}s.`
+        )
+      );
+    }, LOCAL_TRANSCRIPTION_TIMEOUT_MS);
+
+    chrome.runtime.sendMessage(
+      {
+        target: "local-transcriber",
+        action: "transcribeAudio",
+        dataUrl,
+        mode,
+      },
+      (response) => {
+        clearTimeout(timeoutId);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (!response?.ok || !normalizeText(response?.text)) {
+          reject(new Error(response?.error || "Local Whisper returned no transcript."));
+          return;
+        }
+        resolve({
+          text: normalizeText(response.text),
+          backend: normalizeText(response.backend),
+          model: normalizeText(response.model),
+        });
+      }
+    );
+  });
+}
+
+function getLocalAudioTranscript(dataUrl, mode) {
+  const normalizedMode = normalizeAudioTranscriptionMode(mode);
+  const cacheKey = `${normalizedMode}:${getAudioTranscriptionCacheKey(dataUrl)}`;
+  if (localAudioTranscriptionCache.has(cacheKey)) {
+    return localAudioTranscriptionCache.get(cacheKey);
+  }
+
+  const transcription = requestLocalAudioTranscript(dataUrl, normalizedMode).catch(
+    (error) => {
+      localAudioTranscriptionCache.delete(cacheKey);
+      throw error;
+    }
+  );
+  localAudioTranscriptionCache.set(cacheKey, transcription);
   return transcription;
 }
 
@@ -765,6 +875,10 @@ function shouldPreferGeminiForCustomAudio(providerOrder, credentials, hasAudio) 
   return CUSTOM_LLM_GEMINI_AUDIO_PRIORITY_PATTERN.test(
     normalizeText(credentials?.customLlmModel)
   );
+}
+
+function isListeningTranscriptionQuestion(question) {
+  return LISTENING_QUESTION_PATTERN.test(normalizeText(question));
 }
 
 function moveProviderFirst(providerOrder, providerId) {
@@ -1515,6 +1629,9 @@ function loadMaterialState() {
       const materialRevision = Number(items.materialRevision) || 0;
       const materialSources = normalizeMaterialSources(items.materialSources);
       const freeApiMode = Boolean(items.freeApiMode);
+      const audioTranscriptionMode = normalizeAudioTranscriptionMode(
+        items.audioTranscriptionMode
+      );
       const legacyApiKey = normalizeText(items.apiKey);
       const openaiApiKey = normalizeText(items.openaiApiKey || legacyApiKey);
       const openrouterApiKey = normalizeText(items.openrouterApiKey);
@@ -1540,6 +1657,7 @@ function loadMaterialState() {
         materialSources,
         hasPdfSource,
         freeApiMode,
+        audioTranscriptionMode,
         apiProviders,
         openaiApiKey,
         openrouterApiKey,
@@ -2693,6 +2811,112 @@ async function buildModelPolicy(providerOrder, credentials) {
   return policy;
 }
 
+function tokenizeSpokenEnglish(value) {
+  const cleaned = String(value || "")
+    .replace(/[‘’]/g, "'")
+    .replace(/\[[^\]]*(?:music|applause|noise)[^\]]*\]/gi, " ");
+  return (cleaned.match(/[A-Za-z0-9]+(?:'[A-Za-z0-9]+)*/g) || []).map(
+    (raw) => ({ raw, key: raw.toLowerCase() })
+  );
+}
+
+function findTokenSequence(tokens, sequence, startIndex = 0) {
+  if (!sequence.length || sequence.length > tokens.length) {
+    return -1;
+  }
+  for (
+    let index = Math.max(0, startIndex);
+    index <= tokens.length - sequence.length;
+    index += 1
+  ) {
+    const matches = sequence.every(
+      (token, offset) => tokens[index + offset]?.key === token.key
+    );
+    if (matches) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function inferBlankAnswerFromTranscript(
+  question,
+  transcript,
+  { options = [], targetType = "standard" } = {}
+) {
+  if (
+    (Array.isArray(options) && options.length) ||
+    ["gapfill", "multiblank", "ordering"].includes(targetType)
+  ) {
+    return "";
+  }
+
+  const questionText = String(question || "");
+  const blankMatch = /\[blank\]/i.exec(questionText);
+  if (!blankMatch) {
+    return "";
+  }
+
+  const transcriptTokens = tokenizeSpokenEnglish(transcript);
+  if (!transcriptTokens.length) {
+    return "";
+  }
+
+  const prefixTokens = tokenizeSpokenEnglish(
+    questionText.slice(0, blankMatch.index)
+  );
+  const suffixTokens = tokenizeSpokenEnglish(
+    questionText.slice(blankMatch.index + blankMatch[0].length)
+  );
+  const maxPrefixLength = Math.min(8, prefixTokens.length);
+  const maxSuffixLength = Math.min(8, suffixTokens.length);
+  let bestMatch = null;
+
+  for (let prefixLength = maxPrefixLength; prefixLength >= 1; prefixLength -= 1) {
+    const prefix = prefixTokens.slice(-prefixLength);
+    let prefixIndex = findTokenSequence(transcriptTokens, prefix);
+    while (prefixIndex >= 0) {
+      const answerStart = prefixIndex + prefix.length;
+      for (let suffixLength = maxSuffixLength; suffixLength >= 1; suffixLength -= 1) {
+        const suffix = suffixTokens.slice(0, suffixLength);
+        const suffixIndex = findTokenSequence(
+          transcriptTokens,
+          suffix,
+          answerStart + 1
+        );
+        const answerLength = suffixIndex - answerStart;
+        if (suffixIndex < 0 || answerLength < 1 || answerLength > 8) {
+          continue;
+        }
+        const score = (prefixLength + suffixLength) * 20 - answerLength;
+        if (!bestMatch || score > bestMatch.score) {
+          bestMatch = {
+            score,
+            tokens: transcriptTokens.slice(answerStart, suffixIndex),
+          };
+        }
+      }
+      prefixIndex = findTokenSequence(
+        transcriptTokens,
+        prefix,
+        prefixIndex + 1
+      );
+    }
+  }
+
+  if (bestMatch?.tokens?.length) {
+    return bestMatch.tokens.map((token) => token.raw).join(" ");
+  }
+
+  // Linguaporta listening clips often contain only the missing word or short
+  // phrase. In that case the entire local transcript is the answer.
+  if (transcriptTokens.length <= 6) {
+    return transcriptTokens.map((token) => token.raw).join(" ");
+  }
+
+  return "";
+}
+
 async function callAiChat(
   question,
   options,
@@ -2719,13 +2943,66 @@ async function callAiChat(
   const cleanedRejectedAnswers = Array.isArray(rejectedAnswers)
     ? rejectedAnswers.map((answer) => normalizeText(answer)).filter(Boolean)
     : [];
+  const audioTranscriptionMode = normalizeAudioTranscriptionMode(
+    credentials?.audioTranscriptionMode
+  );
+  const hasListeningAudio = Boolean(
+    cleanedAudios.length && isListeningTranscriptionQuestion(cleanedQuestion)
+  );
+  let localTranscript = null;
+  if (hasListeningAudio && audioTranscriptionMode !== "cloud") {
+    try {
+      localTranscript = await getLocalAudioTranscript(
+        cleanedAudios[0],
+        audioTranscriptionMode
+      );
+    } catch (error) {
+      console.warn(
+        "Local Whisper failed; falling back to the configured cloud audio path:",
+        error
+      );
+      logFallbackEvent(
+        `Local Whisper failed (${normalizeText(error?.message || error).slice(0, 160)}) -> used cloud audio fallback`
+      );
+    }
+  }
+
+  const localTranscriptAnswer = localTranscript
+    ? inferBlankAnswerFromTranscript(cleanedQuestion, localTranscript.text, {
+        options: cleanedOptions,
+        targetType,
+      })
+    : "";
+  const rejectedLocalTranscriptAnswer = cleanedRejectedAnswers.some(
+    (rejectedAnswer) =>
+      compactText(rejectedAnswer) === compactText(localTranscriptAnswer)
+  );
+  if (localTranscriptAnswer && !rejectedLocalTranscriptAnswer) {
+    const result = {
+      answer: localTranscriptAnswer,
+      model: localTranscript.model || "onnx-community/whisper-tiny.en",
+      provider: "local",
+      audioMode: `Local Whisper tiny.en (${localTranscript.backend || "local"})`,
+    };
+    const localCacheKey = JSON.stringify({
+      requestKey: requestKey || cleanedQuestion,
+      targetType,
+      audioFingerprint: cleanedAudios.map((audioFile) => audioFile.length).join(","),
+      audioTranscriptionMode,
+      localAudioBackend: localTranscript.backend || "",
+      localTranscriptAnswer,
+    });
+    answerCache.set(localCacheKey, result);
+    return result;
+  }
+  const needsCloudAudio = Boolean(hasListeningAudio && !localTranscript);
   const effectiveProviderOrder = getEffectiveProviderOrderForQuestion(
     cleanedQuestion,
     cleanedOptions,
     targetType,
     providerOrder,
     credentials,
-    Boolean(cleanedAudios.length),
+    needsCloudAudio,
     Boolean(preferOpenAiSol)
   );
   const modelPolicy = {
@@ -2746,6 +3023,8 @@ async function callAiChat(
     openRouterBudgetMode: modelPolicy.openRouterBudgetMode,
     imagesFingerprint: cleanedImages.map((image) => image.length).join(","),
     audioFingerprint: cleanedAudios.map((audioFile) => audioFile.length).join(","),
+    audioTranscriptionMode,
+    localAudioBackend: localTranscript?.backend || "",
     rejectedAnswers: cleanedRejectedAnswers,
   });
 
@@ -2797,12 +3076,22 @@ async function callAiChat(
           "Do not return any of those answers again. Reconsider the Japanese cue and choose a different exact textbook answer.",
         ].join("\n");
       }
-      let audioMode = cleanedAudios.length
-        ? plan.providerId === PROVIDER_GEMINI
+      let audioMode = "";
+      if (localTranscript) {
+        requestPrompt +=
+          `\n\nAudio transcript (created locally with Whisper; use this as the authoritative listening content):\n` +
+          `${localTranscript.text}\nAnswer the exercise using this transcript and the visible context.`;
+        audioMode = `Local Whisper tiny.en (${localTranscript.backend || "local"})`;
+      } else if (hasListeningAudio) {
+        audioMode = plan.providerId === PROVIDER_GEMINI
           ? "Gemini direct audio"
-          : "Visible-text fallback"
-        : "";
-      if (plan.providerId === PROVIDER_OPENAI && cleanedAudios.length) {
+          : "Visible-text fallback";
+      }
+      if (
+        !localTranscript &&
+        plan.providerId === PROVIDER_OPENAI &&
+        hasListeningAudio
+      ) {
         try {
           const transcript = await getOpenAiAudioTranscript(
             cleanedAudios[0],
@@ -2832,8 +3121,11 @@ async function callAiChat(
         credentials,
         {
           images: plan.images,
-          audios: plan.providerId === PROVIDER_GEMINI ? cleanedAudios : [],
-          allowThinking: plan.allowThinking || Boolean(cleanedAudios.length),
+          audios:
+            !localTranscript && hasListeningAudio && plan.providerId === PROVIDER_GEMINI
+              ? cleanedAudios
+              : [],
+          allowThinking: plan.allowThinking || hasListeningAudio,
         }
       );
       const rawAnswer = response.answer;
@@ -3576,7 +3868,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const preferGeminiAudio = shouldPreferGeminiForCustomAudio(
         activeProviders,
         materialState,
-        Boolean(cleanedAudios.length)
+        Boolean(
+          cleanedAudios.length &&
+            isListeningTranscriptionQuestion(question) &&
+            normalizeAudioTranscriptionMode(
+              materialState.audioTranscriptionMode
+            ) === "cloud"
+        )
       );
       if (
         preferGeminiAudio &&
