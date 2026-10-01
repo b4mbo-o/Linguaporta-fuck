@@ -53,6 +53,9 @@ let runtimeActionEpoch = 0;
 const retrySubmitReservations = new Set();
 const aiAttemptReservationChains = new Map();
 const playedListeningAudioKeys = new Set();
+// Duration (ms) of the currently playing listening clip, captured so the
+// auto-submit can wait for the audio to finish instead of cutting it off.
+let listeningAudioDurationMs = 0;
 
 const runtimeState = {
   phase: "booting",
@@ -1875,11 +1878,7 @@ function estimateHumanSubmitDelayMs(question, answerText) {
     ? question.options.length
     : 0;
   const isOrdering = question?.targetType === "ordering";
-  const hasAudio = Boolean(
-    (Array.isArray(question?.audios) && question.audios.length) ||
-      (Array.isArray(question?.audioSourceUrls) &&
-        question.audioSourceUrls.length)
-  );
+  const isListening = isLinguaportaListeningQuestion(question);
 
   let delay = 900;
   delay += Math.min(questionText.length, 400) * 12;
@@ -1888,8 +1887,10 @@ function estimateHumanSubmitDelayMs(question, answerText) {
   if (isOrdering) {
     delay += optionCount * 350 + 800;
   }
-  if (hasAudio) {
-    delay += 2500;
+  if (isListening) {
+    // Let the clip play through (duration is captured when it starts) instead
+    // of submitting immediately and cutting the audio off.
+    delay += Math.max(2500, listeningAudioDurationMs + 800);
   }
   if (question?.hasExistingAnswer) {
     delay += 400;
@@ -2848,6 +2849,26 @@ function playLinguaportaListeningAudio(question) {
     playButton.click();
   } catch (_error) {
     // ignore autoplay/policy failures
+  }
+
+  // Track the clip length so submission waits for it to finish.
+  listeningAudioDurationMs = 0;
+  const scope =
+    (question?.questionRoot &&
+      question.questionRoot.closest &&
+      question.questionRoot.closest("form")) ||
+    document.querySelector("form[name=ExpForm]") ||
+    document;
+  const audio = scope.querySelector("audio#sound, audio");
+  if (audio) {
+    const captureDuration = () => {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        listeningAudioDurationMs = Math.round(audio.duration * 1000);
+      }
+    };
+    captureDuration();
+    audio.addEventListener("loadedmetadata", captureDuration, { once: true });
+    audio.addEventListener("durationchange", captureDuration, { once: true });
   }
   return true;
 }
